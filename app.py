@@ -11,7 +11,8 @@ app = Flask(__name__)
 CORS(app)
 
 # ── Download MPXJ JAR if not present ────────────────────────────────────────
-MPXJ_JAR_PATH = os.environ.get('MPXJ_JAR_PATH', '/opt/mpxj/mpxj.jar')
+# CHANGED: Now saves to /app/mpxj.jar instead of /opt/ to avoid Docker Permission Denied errors
+MPXJ_JAR_PATH = os.environ.get('MPXJ_JAR_PATH', '/app/mpxj.jar')
 MPXJ_VERSION = os.environ.get('MPXJ_VERSION', '15.0.0')
 MPXJ_JAR_URL = f'https://repo1.maven.org/maven2/net/sf/mpxj/mpxj/{MPXJ_VERSION}/mpxj-{MPXJ_VERSION}.jar'
 
