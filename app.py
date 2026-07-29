@@ -36,6 +36,16 @@ LINK_TYPE_MAP = {
     'START_FINISH': 'SF',
 }
 
+# ── Constraint type mapping ──────────────────────────────────────────────────
+def _constraint_type(task):
+    try:
+        c = task.getConstraint()
+        if c is not None:
+            return str(c.toString())
+    except Exception:
+        pass
+    return ''
+
 
 def _safe_str(val):
     if val is None:
@@ -48,7 +58,6 @@ def _to_date_str(dt):
     if dt is None:
         return ''
     try:
-        # LocalDateTime → toLocalDate() → "2003-01-01"
         return str(dt.toLocalDate().toString())
     except Exception:
         pass
@@ -86,17 +95,49 @@ def _get_duration_days(task):
     return 1
 
 
-def _get_predecessor_info(task):
-    """Extract the first predecessor link. Returns (pred_uid, link_type, lag_days)."""
+def _get_actual_duration_days(task):
+    try:
+        dur = task.getActualDuration()
+        if dur is not None:
+            val = dur.getDuration()
+            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
+            if val:
+                if 'HOUR' in units:
+                    return max(0, round(val / 8))
+                return int(val)
+    except Exception:
+        pass
+    return 0
+
+
+def _get_remaining_duration_days(task):
+    try:
+        dur = task.getRemainingDuration()
+        if dur is not None:
+            val = dur.getDuration()
+            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
+            if val:
+                if 'HOUR' in units:
+                    return max(0, round(val / 8))
+                return int(val)
+    except Exception:
+        pass
+    return 0
+
+
+def _get_predecessors(task):
+    """Extract ALL predecessor links, not just the first."""
+    links = []
     try:
         preds = task.getPredecessors()
         if not preds:
-            return '', 'FS', 0
+            return links
         for pred in preds:
             pred_task = pred.getPredecessorTask()
             if pred_task is None:
                 continue
             pred_uid = str(pred_task.getUniqueID())
+            pred_id = str(pred_task.getID())
 
             link_type_raw = str(pred.getType())
             link_type = 'FS'
@@ -119,15 +160,40 @@ def _get_predecessor_info(task):
             except Exception:
                 pass
 
-            return pred_uid, link_type, lag_days
+            links.append({
+                'pred_unique_id': pred_uid,
+                'pred_id': pred_id,
+                'link_type': link_type,
+                'lag_days': lag_days,
+            })
     except Exception:
         pass
-    return '', 'FS', 0
+    return links
 
 
 def _is_summary_task(task):
     try:
         val = task.getSummary()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
+
+
+def _is_milestone(task):
+    try:
+        val = task.getMilestone()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
+
+
+def _is_critical(task):
+    try:
+        val = task.getCritical()
         if val is not None:
             return bool(val)
     except Exception:
@@ -153,6 +219,88 @@ def _get_parent_uid(task):
     except Exception:
         pass
     return ''
+
+
+def _get_percentage_complete(task):
+    try:
+        pct = task.getPercentageComplete()
+        if pct is not None:
+            return float(pct)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_priority(task):
+    try:
+        p = task.getPriority()
+        if p is not None:
+            return str(p.toString())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_cost(task):
+    try:
+        cost = task.getCost()
+        if cost is not None:
+            return float(cost)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_calendar_name(task):
+    try:
+        cal = task.getCalendar()
+        if cal is not None:
+            return str(cal.getName())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_notes(task):
+    try:
+        notes = task.getNotes()
+        if notes is not None:
+            return str(notes)
+    except Exception:
+        pass
+    return ''
+
+
+def _get_resource_names(task):
+    """Extract resource assignment names."""
+    names = []
+    try:
+        assignments = task.getResourceAssignments()
+        if not assignments:
+            return names
+        for assign in assignments:
+            try:
+                res = assign.getResource()
+                if res is not None:
+                    name = str(res.getName())
+                    if name:
+                        names.append(name)
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return names
+
+
+def _compute_status(task, pct_complete, actual_start, actual_finish):
+    """Derive a status from MPXJ actuals + percentage complete."""
+    if pct_complete >= 100:
+        return 'completed'
+    if actual_start is not None and actual_finish is not None:
+        return 'completed'
+    if pct_complete > 0 or actual_start is not None:
+        return 'in_progress'
+    return 'pending'
 
 
 def _extract_baselines(project):
@@ -212,30 +360,93 @@ def parse():
                 if not name:
                     continue
 
-                uid = str(task.getUniqueID())
-                start = task.getStart()
-                finish = task.getFinish()
+                # ── IDs ──────────────────────────────────────────────────────
+                # getID() = Asta UTID (user-visible task identifier)
+                # getUniqueID() = internal MPXJ unique sequence number
+                asta_utid = _safe_str(task.getID())
+                mpxj_uid = str(task.getUniqueID())
+
+                # ── Dates ─────────────────────────────────────────────────────
+                planned_start = task.getStart()
+                planned_finish = task.getFinish()
+                actual_start = task.getActualStart()
+                actual_finish = task.getActualFinish()
+                early_start = task.getEarlyStart()
+                early_finish = task.getEarlyFinish()
+                late_start = task.getLateStart()
+                late_finish = task.getLateFinish()
+                baseline_start = task.getBaselineStart()
+                baseline_finish = task.getBaselineFinish()
 
                 # Skip the project summary task (root level, no dates)
-                if start is None and finish is None:
+                if planned_start is None and planned_finish is None and actual_start is None:
                     continue
 
+                # ── Progress ────────────────────────────────────────────────
+                pct_complete = _get_percentage_complete(task)
+
+                # ── Hierarchy ───────────────────────────────────────────────
                 parent_uid = _get_parent_uid(task)
                 is_summary = _is_summary_task(task)
-                predecessor_id, link_type, lag_days = _get_predecessor_info(task)
+
+                # ── Dependencies (all links) ────────────────────────────────
+                predecessors = _get_predecessors(task)
+                # First predecessor for backward compat with schema's single-field
+                first_pred = predecessors[0] if predecessors else None
+
+                # ── Flags & attributes ──────────────────────────────────────
+                is_milestone = _is_milestone(task)
+                is_critical = _is_critical(task)
+                outline_level = _get_outline_level(task)
+                priority = _get_priority(task)
+                cost = _get_cost(task)
+                calendar_name = _get_calendar_name(task)
+                notes = _get_notes(task)
+                constraint = _constraint_type(task)
+                constraint_date = _to_date_str(task.getConstraintDate())
+                resources = _get_resource_names(task)
+
+                # ── Status from actuals ─────────────────────────────────────
+                status = _compute_status(task, pct_complete, actual_start, actual_finish)
+
+                # Use the Asta UTID as the primary asta_id, fallback to UniqueID
+                asta_id = asta_utid if asta_utid else mpxj_uid
 
                 activities.append({
-                    'asta_id': uid,
+                    'asta_id': asta_id,
+                    'mpxj_unique_id': mpxj_uid,
                     'name': str(name),
-                    'start_date': _to_date_str(start),
-                    'end_date': _to_date_str(finish) or _to_date_str(start),
+                    'start_date': _to_date_str(planned_start),
+                    'end_date': _to_date_str(planned_finish) or _to_date_str(planned_start),
+                    'actual_start': _to_date_str(actual_start),
+                    'actual_finish': _to_date_str(actual_finish),
+                    'early_start': _to_date_str(early_start),
+                    'early_finish': _to_date_str(early_finish),
+                    'late_start': _to_date_str(late_start),
+                    'late_finish': _to_date_str(late_finish),
+                    'baseline_start': _to_date_str(baseline_start),
+                    'baseline_finish': _to_date_str(baseline_finish),
                     'duration_days': _get_duration_days(task),
-                    'wbs_level': _get_outline_level(task),
+                    'actual_duration_days': _get_actual_duration_days(task),
+                    'remaining_duration_days': _get_remaining_duration_days(task),
+                    'percentage_complete': pct_complete,
+                    'status': status,
+                    'wbs_level': outline_level,
                     'parent_asta_id': parent_uid,
                     'is_summary': is_summary,
-                    'predecessor_asta_id': predecessor_id,
-                    'link_type': link_type,
-                    'lag_days': lag_days,
+                    'is_milestone': is_milestone,
+                    'is_critical': is_critical,
+                    'predecessor_asta_id': first_pred['pred_unique_id'] if first_pred else '',
+                    'link_type': first_pred['link_type'] if first_pred else 'FS',
+                    'lag_days': first_pred['lag_days'] if first_pred else 0,
+                    'all_predecessors': predecessors,
+                    'priority': priority,
+                    'cost': cost,
+                    'calendar_name': calendar_name,
+                    'notes': notes,
+                    'constraint_type': constraint,
+                    'constraint_date': constraint_date,
+                    'resources': resources,
                 })
             except Exception:
                 continue
