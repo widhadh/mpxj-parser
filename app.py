@@ -37,6 +37,31 @@ LINK_TYPE_MAP = {
 }
 
 # ── Constraint type mapping ──────────────────────────────────────────────────
+def _get_asta_utid(task):
+    """Return the Asta Powerproject Unique Task ID (UTID).
+
+    MPXJ exposes this via getActivityID() — which for Powerproject files is
+    populated from the programme's "Unique Task ID" attribute (the alphanumeric
+    identifier shown in Asta's ID column). getUniqueID() returns MPXJ's own
+    internal integer ID, NOT the Asta UTID.
+
+    Falls back to getUniqueID() if the file doesn't populate Activity ID
+    (e.g. MS Project / Primavera files).
+    """
+    try:
+        aid = task.getActivityID()
+        if aid is not None:
+            s = str(aid).strip()
+            if s:
+                return s
+    except Exception:
+        pass
+    try:
+        return str(task.getUniqueID())
+    except Exception:
+        return ''
+
+
 def _constraint_type(task):
     try:
         c = task.getConstraint()
@@ -142,7 +167,8 @@ def _get_predecessors(task):
             pred_task = pred.getPredecessorTask()
             if pred_task is None:
                 continue
-            pred_uid = str(pred_task.getUniqueID())
+            # Use the Asta UTID (getActivityID) for linking, with getUniqueID as fallback
+            pred_uid = _get_asta_utid(pred_task)
             pred_id = str(pred_task.getID())
 
             link_type_raw = str(pred.getType())
@@ -218,11 +244,11 @@ def _get_outline_level(task):
 
 
 def _get_parent_uid(task):
-    """Return the parent's Asta UTID (getUniqueID()) so it matches the child's asta_id."""
+    """Return the parent's Asta UTID so it matches the child's asta_id."""
     try:
         parent = task.getParentTask()
         if parent is not None:
-            return str(parent.getUniqueID())
+            return _get_asta_utid(parent)
     except Exception:
         pass
     return ''
@@ -266,6 +292,46 @@ def _get_calendar_name(task):
     except Exception:
         pass
     return ''
+
+
+def _extract_working_days(project):
+    """Read the working day-of-week pattern (0=Sun..6=Sat) from the
+    programme's default calendar. Falls back to Mon–Fri."""
+    default = [1, 2, 3, 4, 5]
+    try:
+        cals = list(project.getCalendars())
+    except Exception:
+        return default
+    if not cals:
+        return default
+
+    default_cal = None
+    for c in cals:
+        try:
+            if c.isDefault():
+                default_cal = c
+                break
+        except Exception:
+            pass
+    if default_cal is None:
+        default_cal = cals[0]
+
+    # getWorkingDays() → 7-element array indexed Sunday(0)..Saturday(6),
+    # each element one of Day.WORKING / Day.NON_WORKING / Day.PARENT.
+    try:
+        wd = default_cal.getWorkingDays()
+        if wd and len(wd) == 7:
+            working = []
+            for i, d in enumerate(wd):
+                s = str(d.toString()).upper()
+                if 'WORKING' in s and 'NON' not in s:
+                    working.append(i)
+            if working:
+                return working
+    except Exception:
+        pass
+
+    return default
 
 
 def _get_notes(task):
@@ -324,7 +390,7 @@ def _extract_baselines(project):
             try:
                 for t in bl_project.getTasks():
                     bl_tasks.append({
-                        'aid': str(t.getUniqueID()),
+                        'aid': _get_asta_utid(t),
                         'sd': _to_date_str(t.getStart()),
                         'ed': _to_date_str(t.getFinish()),
                         'od': _to_date_str(t.getStart()),
@@ -368,11 +434,12 @@ def parse():
                     continue
 
                 # ── IDs ──────────────────────────────────────────────────────
-                # getUniqueID() = Asta UTID (permanent unique task identifier
-                #   that never changes — the real "Unique Task ID" from Asta)
+                # getActivityID() = Asta UTID (the "Unique Task ID" shown in
+                #   Asta's ID column — alphanumeric, permanent, user-visible)
+                # getUniqueID() = MPXJ's internal integer unique ID
                 # getID() = sequential display/row ID (renumbered by MPXJ)
-                asta_utid = str(task.getUniqueID())
-                mpxj_uid = _safe_str(task.getID())
+                asta_utid = _get_asta_utid(task)
+                mpxj_uid = _safe_str(task.getUniqueID())
 
                 # ── Dates ─────────────────────────────────────────────────────
                 planned_start = task.getStart()
@@ -471,11 +538,14 @@ def parse():
         project_start = min(all_starts) if all_starts else None
         project_end = max(all_ends) if all_ends else None
 
+        working_days = _extract_working_days(project)
+
         return jsonify({
             'activities': activities,
             'project_start': project_start,
             'project_end': project_end,
             'baselines': baselines,
+            'working_days': working_days,
         })
 
     except Exception as e:
