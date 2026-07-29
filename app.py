@@ -344,8 +344,63 @@ def _get_notes(task):
     return ''
 
 
+def _map_resource_type(res):
+    """Map MPXJ ResourceType → 'permanent' or 'temporary'.
+
+    Asta Powerproject distinguishes permanent resources (labour, plant —
+    allocated for a duration) from consumable/temporary resources (materials —
+    consumed in quantity). MPXJ exposes this via ResourceType:
+        LABOR / EQUIPMENT → 'permanent'
+        MATERIAL          → 'temporary'  (consumable)
+    """
+    try:
+        rt = res.getType()
+        if rt is not None:
+            s = str(rt.toString()).upper()
+            if 'MATERIAL' in s:
+                return 'temporary'
+            if 'LABOR' in s or 'LABOUR' in s or 'EQUIPMENT' in s or 'WORK' in s:
+                return 'permanent'
+            if 'COST' in s:
+                return 'temporary'
+    except Exception:
+        pass
+    return 'permanent'
+
+
+def _get_resource_assignment_units(assign):
+    """Best-effort extraction of the quantity allocated to a task.
+
+    Returns a number (units) — the allocation for this assignment.  MPXJ stores
+    this as a percentage (e.g. 100 = 1 full resource), so we convert to whole
+    units when possible.
+    """
+    # getUnits() → allocation percentage (100 = 1.0 resource)
+    try:
+        u = assign.getUnits()
+        if u is not None:
+            val = float(u)
+            if val and val > 0:
+                # Convert percentage to whole units (100% = 1, 200% = 2)
+                if val >= 100:
+                    return round(val / 100, 2)
+                return round(val / 100, 2)
+    except Exception:
+        pass
+    # getAmount() → absolute amount for consumable resources
+    try:
+        amt = assign.getAmount()
+        if amt is not None:
+            val = float(amt)
+            if val and val > 0:
+                return round(val, 2)
+    except Exception:
+        pass
+    return 1
+
+
 def _get_resource_names(task):
-    """Extract resource assignment names."""
+    """Extract resource assignment names (backward-compatible)."""
     names = []
     try:
         assignments = task.getResourceAssignments()
@@ -363,6 +418,37 @@ def _get_resource_names(task):
     except Exception:
         pass
     return names
+
+
+def _get_resource_assignments(task):
+    """Extract full resource assignments with type and allocated quantity.
+
+    Returns a list of dicts:
+        { name, resource_type ('permanent'|'temporary'), units }
+    """
+    assignments_out = []
+    try:
+        assignments = task.getResourceAssignments()
+        if not assignments:
+            return assignments_out
+        for assign in assignments:
+            try:
+                res = assign.getResource()
+                if res is None:
+                    continue
+                name = str(res.getName())
+                if not name:
+                    continue
+                assignments_out.append({
+                    'name': name,
+                    'resource_type': _map_resource_type(res),
+                    'units': _get_resource_assignment_units(assign),
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return assignments_out
 
 
 def _compute_status(task, pct_complete, actual_start, actual_finish):
@@ -480,6 +566,7 @@ def parse():
                 constraint = _constraint_type(task)
                 constraint_date = _to_date_str(task.getConstraintDate())
                 resources = _get_resource_names(task)
+                resource_assignments = _get_resource_assignments(task)
 
                 # ── Status from actuals ─────────────────────────────────────
                 status = _compute_status(task, pct_complete, actual_start, actual_finish)
@@ -527,6 +614,7 @@ def parse():
                     'constraint_type': constraint,
                     'constraint_date': constraint_date,
                     'resources': resources,
+                    'resource_assignments': resource_assignments,
                 })
             except Exception:
                 continue
