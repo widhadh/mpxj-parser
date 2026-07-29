@@ -1,354 +1,240 @@
 """
-MPXJ Microservice — Parses Asta .pp, MS Project, and P6 files via JPype.
+MPXJ Microservice — parses native Asta Powerproject (.pp) files using the
+open-source MPXJ library and returns structured JSON.
+
+Deploy to Render / any Python host:
+  pip install -r requirements.txt
+  python app.py
+
+Exposes:
+  POST /parse  (multipart/form-data, field: file)  →  JSON { activities, baselines }
 """
+
 import os
-import tempfile
+import io
 import traceback
 from flask import Flask, request, jsonify
-from flask_cors import CORS
-
-# 1. Let the official pip packages handle the heavy lifting!
-import jpype
-import mpxj
-
-# 2. Start the JVM using mpxj's automatic configuration
-jpype.startJVM()
-from jpype import isThreadAttachedToJVM, attachThreadToJVM
-
-# 3. Import the native Java classes safely
-from org.mpxj.reader import UniversalProjectReader
-from org.mpxj import TaskType, RelationType
+from mpxj.reader import MPXJReader
 
 app = Flask(__name__)
-CORS(app)
+
+# ── Link type mapping ─────────────────────────────────────────────────────────
+# MPXJ RelationType enum → our canonical FS/SS/FF/SF
+LINK_TYPE_MAP = {
+    'FINISH_START': 'FS',
+    'START_START': 'SS',
+    'FINISH_FINISH': 'FF',
+    'START_FINISH': 'SF',
+}
 
 
-def attach_jvm():
-    """Ensure the current web request thread is attached to the JVM"""
-    if not isThreadAttachedToJVM():
-        attachThreadToJVM()
+def _safe_str(val):
+    """Safely convert any value to string, returning '' for None."""
+    if val is None:
+        return ''
+    return str(val)
 
 
-def to_iso(java_date):
-    if java_date is None:
-        return None
+def _to_date_str(dt):
+    """Convert a datetime to YYYY-MM-DD string, or '' if None."""
+    if dt is None:
+        return ''
     try:
-        return str(java_date.toString())[:10]
-    except:
-        return None
+        return dt.strftime('%Y-%m-%d')
+    except (AttributeError, ValueError):
+        return ''
 
 
-def get_task_id(task):
+def _get_duration_days(task):
+    """Extract duration in days from a task, with fallback to date range."""
     try:
-        tid = task.getID()
-        if tid:
-            return str(tid)
-    except:
+        dur = task.get_duration()
+        if dur is not None:
+            val = dur.get_duration()
+            units = str(dur.get_units()) if hasattr(dur, 'get_units') else ''
+            # MPXJ returns duration in hours by default for many formats
+            if 'HOUR' in units.upper() and val:
+                return max(1, round(val / 8))
+            if val and val > 0:
+                return val
+    except Exception:
         pass
+    # Fallback: compute from start/finish
     try:
-        uid = task.getUniqueID()
-        if uid:
-            return str(uid)
-    except:
-        pass
-    return None
-
-
-def get_wbs_level(task):
-    try:
-        level = task.getWBSLevel()
-        if level:
-            return int(str(level))
-    except:
-        pass
-    try:
-        outline = task.getOutlineLevel()
-        if outline is not None:
-            return int(str(outline))
-    except:
+        start = task.get_start()
+        finish = task.get_finish()
+        if start and finish:
+            delta = (finish - start).days + 1
+            return max(1, delta)
+    except Exception:
         pass
     return 1
 
 
-def get_relation_type_str(rel):
+def _get_predecessor_info(task, task_by_uid):
+    """Extract the first predecessor link from a task.
+    Returns (predecessor_id, link_type, lag_days)."""
     try:
-        rt = rel.getType()
-        if rt == RelationType.FINISH_START:
-            return 'FS'
-        elif rt == RelationType.START_START:
-            return 'SS'
-        elif rt == RelationType.FINISH_FINISH:
-            return 'FF'
-        elif rt == RelationType.START_FINISH:
-            return 'SF'
-    except:
-        pass
-    return 'FS'
-
-
-def extract_task_data(task):
-    task_id = get_task_id(task)
-    if not task_id:
-        return None
-
-    sd = to_iso(task.getPlannedStart()) or to_iso(task.getStart())
-    ed = to_iso(task.getPlannedFinish()) or to_iso(task.getFinish())
-
-    duration_days = None
-    try:
-        dur = task.getDuration()
-        if dur:
-            duration_days = int(str(dur.getDuration()))
-    except:
-        pass
-
-    wbs_level = get_wbs_level(task)
-
-    is_summary = False
-    try:
-        if task.getSubprojects() and task.getSubprojects().size() > 0:
-            is_summary = True
-        if task.getTaskType() == TaskType.NULL:
-            is_summary = True
-    except:
-        pass
-
-    parent_task_id = None
-    try:
-        parent = task.getParentTask()
-        if parent:
-            parent_task_id = get_task_id(parent)
-    except:
-        pass
-
-    name = ''
-    try:
-        n = task.getName()
-        if n:
-            name = str(n)
-    except:
-        pass
-
-    status = 'pending'
-    try:
-        pct = task.getPercentageComplete()
-        if pct is not None and float(str(pct)) >= 100:
-            status = 'completed'
-    except:
-        pass
-
-    return {
-        'asta_id': task_id,
-        'name': name,
-        'scheduled_date': sd,
-        'start_date': sd,
-        'end_date': ed,
-        'original_date': sd,
-        'duration_days': duration_days,
-        'wbs_level': wbs_level,
-        'is_summary': is_summary,
-        'parent_asta_id': parent_task_id,
-        'status': status,
-    }
-
-
-def extract_relationships(project):
-    relationships = []
-    try:
-        for task in project.getTasks():
-            src_id = get_task_id(task)
-            if not src_id:
+        preds = task.get_predecessors()
+        if not preds:
+            return '', 'FS', 0
+        for pred in preds:
+            pred_task = pred.get_predecessor_task()
+            if pred_task is None:
                 continue
+            pred_uid = str(pred_task.get_unique_id())
+            # Map link type
+            link_type_raw = str(pred.get_type())
+            link_type = 'FS'
+            for key, val in LINK_TYPE_MAP.items():
+                if key in link_type_raw.upper():
+                    link_type = val
+                    break
+            # Extract lag
+            lag_days = 0
             try:
-                rels = task.getTaskPredecessors()
-                if not rels:
-                    continue
-                for rel in rels:
-                    pred_task = rel.getPredecessorTask()
-                    if not pred_task:
-                        continue
-                    pred_id = get_task_id(pred_task)
-                    if not pred_id:
-                        continue
-                    lag = 0
-                    try:
-                        lag_dur = rel.getLag()
-                        if lag_dur:
-                            lag = int(str(lag_dur.getDuration()))
-                    except:
-                        pass
-                    relationships.append({
-                        'predecessor_asta_id': pred_id,
-                        'successor_asta_id': src_id,
-                        'link_type': get_relation_type_str(rel),
-                        'lag_days': lag,
-                    })
-            except:
+                lag = pred.get_lag()
+                if lag is not None:
+                    lag_val = lag.get_duration()
+                    lag_units = str(lag.get_units()) if hasattr(lag, 'get_units') else ''
+                    if lag_val:
+                        if 'HOUR' in lag_units.upper():
+                            lag_days = round(lag_val / 8)
+                        else:
+                            lag_days = lag_val
+            except Exception:
                 pass
-    except:
+            return pred_uid, link_type, lag_days
+    except Exception:
         pass
-    return relationships
+    return '', 'FS', 0
 
 
-def order_depth_first(activities):
-    if not activities:
-        return activities
-    by_id = {a['asta_id']: a for a in activities if a.get('asta_id')}
-    children = {}
-    roots = []
-    for a in activities:
-        pid = a.get('parent_asta_id')
-        if pid and pid in by_id:
-            children.setdefault(pid, []).append(a)
-        else:
-            roots.append(a)
-    ordered = []
-    visited = set()
-
-    def visit(act):
-        aid = act.get('asta_id')
-        if aid in visited:
-            return
-        visited.add(aid)
-        ordered.append(act)
-        for child in children.get(aid, []):
-            visit(child)
-
-    for root in roots:
-        visit(root)
-    for a in activities:
-        if a.get('asta_id') not in visited:
-            ordered.append(a)
-    return ordered
+def _is_summary_task(task):
+    """Determine if a task is a summary task."""
+    try:
+        val = task.get_summary()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
 
 
-def reconstruct_hierarchy(activities):
-    if not activities:
-        return activities
-    has_parent = sum(1 for a in activities if a.get('parent_asta_id'))
-    if has_parent <= len(activities) * 0.5:
-        stack = []
-        for act in activities:
-            level = act.get('wbs_level', 1) or 1
-            while stack and stack[-1][0] >= level:
-                stack.pop()
-            act['parent_asta_id'] = stack[-1][1]['asta_id'] if stack else None
-            stack.append((level, act))
-    return order_depth_first(activities)
+def _get_outline_level(task):
+    """Get the WBS/outline level for a task."""
+    try:
+        level = task.get_outline_level()
+        if level is not None:
+            return str(level)
+    except Exception:
+        pass
+    return ''
 
 
-def extract_baselines(project):
+def _get_parent_uid(task):
+    """Get the unique ID of the parent task, if any."""
+    try:
+        parent = task.get_parent_task()
+        if parent is not None:
+            return str(parent.get_unique_id())
+    except Exception:
+        pass
+    return ''
+
+
+def _extract_baselines(project):
+    """Extract baseline snapshots from the project."""
     baselines = []
     try:
-        baseline_projects = project.getBaselines()
-        if not baseline_projects:
+        bl_list = project.get_baselines()
+        if not bl_list:
             return baselines
-        for idx in range(baseline_projects.size()):
+        for bl in bl_list:
+            bl_tasks = []
             try:
-                bl_project = baseline_projects[idx]
-                bl_name = f'Baseline {idx + 1}'
-                bl_date = None
-                try:
-                    props = bl_project.getProjectProperties()
-                    if props:
-                        pn = props.getName()
-                        if pn:
-                            bl_name = str(pn)
-                        sd = props.getStartDate()
-                        if sd:
-                            bl_date = str(sd.toString())[:10]
-                except:
-                    pass
-                bl_tasks = []
-                try:
-                    bl_tasks_list = bl_project.getTasks()
-                    if bl_tasks_list:
-                        for j in range(bl_tasks_list.size()):
-                            task = bl_tasks_list[j]
-                            tid = get_task_id(task)
-                            if not tid:
-                                continue
-                            sd = to_iso(task.getPlannedStart()) or to_iso(task.getStart())
-                            ed = to_iso(task.getPlannedFinish()) or to_iso(task.getFinish())
-                            if sd or ed:
-                                bl_tasks.append({
-                                    'aid': tid,
-                                    'sd': sd or '',
-                                    'ed': ed or '',
-                                    'od': sd or '',
-                                })
-                except:
-                    pass
-                baselines.append({'name': bl_name, 'date': bl_date, 'tasks': bl_tasks})
-            except Exception as e:
-                print(f'Error reading baseline {idx}: {e}')
-    except Exception as e:
-        print(f'Error reading baselines: {e}')
+                for t in bl.get_tasks():
+                    bl_tasks.append({
+                        'aid': str(t.get_unique_id()),
+                        'sd': _to_date_str(t.get_start()),
+                        'ed': _to_date_str(t.get_finish()),
+                        'od': _to_date_str(t.get_start()),
+                    })
+            except Exception:
+                pass
+            if bl_tasks:
+                baselines.append({
+                    'name': _safe_str(bl.get_name()) or f'Baseline {len(baselines) + 1}',
+                    'date': _to_date_str(bl.get_start()),
+                    'tasks': bl_tasks,
+                })
+    except Exception:
+        pass
     return baselines
 
 
 @app.route('/parse', methods=['POST'])
-def parse_file():
-    attach_jvm()
+def parse():
     if 'file' not in request.files:
         return jsonify({'error': 'No file provided'}), 400
-    file = request.files['file']
-    if not file.filename:
-        return jsonify({'error': 'No filename provided'}), 400
 
-    ext = os.path.splitext(file.filename)[1].lower()
-    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=ext)
+    uploaded_file = request.files['file']
+    tmp_path = f'/tmp/{uploaded_file.filename}'
+
     try:
-        file.save(tmp.name)
-        tmp.close()
-        try:
-            reader = UniversalProjectReader()
-            project = reader.read(str(tmp.name))
-        except Exception as e:
-            if 'password' in str(e).lower() or 'protect' in str(e).lower():
-                return jsonify({'error': 'File is password-protected. Remove protection in Asta and re-upload.'}), 422
-            return jsonify({'error': f'Failed to parse file: {str(e)}'}), 500
+        uploaded_file.save(tmp_path)
+        project = MPXJReader.read(tmp_path)
 
-        project_start = project_end = None
-        try:
-            props = project.getProjectProperties()
-            if props:
-                project_start = to_iso(props.getStartDate())
-                project_end = to_iso(props.getFinishDate())
-        except:
-            pass
+        tasks = list(project.get_tasks())
+        task_by_uid = {}
+        for t in tasks:
+            try:
+                task_by_uid[str(t.get_unique_id())] = t
+            except Exception:
+                pass
 
         activities = []
-        all_dates = []
-        try:
-            tasks = project.getTasks()
-            if tasks:
-                for i in range(tasks.size()):
-                    act = extract_task_data(tasks[i])
-                    if act:
-                        activities.append(act)
-                        if act['scheduled_date']:
-                            all_dates.append(act['scheduled_date'])
-                        if act['end_date']:
-                            all_dates.append(act['end_date'])
-        except Exception as e:
-            print(f'Error extracting tasks: {e}')
+        for task in tasks:
+            try:
+                name = task.get_name()
+                if not name:
+                    continue
 
-        for rel in extract_relationships(project):
-            for act in activities:
-                if act['asta_id'] == rel['successor_asta_id']:
-                    act['predecessor_asta_id'] = rel['predecessor_asta_id']
-                    act['link_type'] = rel['link_type']
-                    act['lag_days'] = rel.get('lag_days', 0)
-                    break
+                uid = str(task.get_unique_id())
+                start = task.get_start()
+                finish = task.get_finish()
 
-        activities = reconstruct_hierarchy(activities)
-        all_dates = sorted([d for d in all_dates if d])
-        if all_dates:
-            project_start = project_start or all_dates[0]
-            project_end = project_end or all_dates[-1]
+                # Skip the project summary task (root level, no dates)
+                if not start and not finish:
+                    continue
 
-        baselines = extract_baselines(project)
+                parent_uid = _get_parent_uid(task)
+                is_summary = _is_summary_task(task)
+                predecessor_id, link_type, lag_days = _get_predecessor_info(task, task_by_uid)
+
+                activities.append({
+                    'asta_id': uid,
+                    'name': name,
+                    'start_date': _to_date_str(start),
+                    'end_date': _to_date_str(finish) or _to_date_str(start),
+                    'duration_days': _get_duration_days(task),
+                    'wbs_level': _get_outline_level(task),
+                    'parent_asta_id': parent_uid,
+                    'is_summary': is_summary,
+                    'predecessor_asta_id': predecessor_id,
+                    'link_type': link_type,
+                    'lag_days': lag_days,
+                })
+            except Exception:
+                continue
+
+        baselines = _extract_baselines(project)
+
+        # Compute project date range
+        all_starts = [a['start_date'] for a in activities if a['start_date']]
+        all_ends = [a['end_date'] for a in activities if a['end_date']]
+        project_start = min(all_starts) if all_starts else None
+        project_end = max(all_ends) if all_ends else None
 
         return jsonify({
             'activities': activities,
@@ -356,21 +242,25 @@ def parse_file():
             'project_end': project_end,
             'baselines': baselines,
         })
+
     except Exception as e:
-        traceback.print_exc()
-        return jsonify({'error': f'Unexpected error: {str(e)}'}), 500
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
     finally:
-        try:
-            os.unlink(tmp.name)
-        except:
-            pass
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
 
 
-@app.route('/health', methods=['GET'])
+@app.route('/', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({'status': 'ok', 'service': 'mpxj-parser'})
 
 
 if __name__ == '__main__':
-    # Default to 8000 for standard web deployments
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
