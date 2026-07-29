@@ -79,7 +79,11 @@ def _safe_str(val):
 
 
 def _to_date_str(dt):
-    """Convert a Java LocalDateTime / Date to YYYY-MM-DD, or '' if None."""
+    """Convert a Java LocalDateTime / Date to YYYY-MM-DD, or '' if None.
+
+    NOTE: This truncates the time-of-day. Use _to_iso_exact when the frontend
+    Gantt needs to know exactly when a task starts/stops (e.g. a half-day
+    finishing at 12:00)."""
     if dt is None:
         return ''
     try:
@@ -93,6 +97,36 @@ def _to_date_str(dt):
     except Exception:
         pass
     return ''
+
+
+def _to_iso_exact(dt):
+    """Convert a Java LocalDateTime / Date to a FULL ISO timestamp
+    (YYYY-MM-DDTHH:MM:SS), preserving the time-of-day.
+
+    This is the absolute source of truth for task start/stop times — the
+    frontend Gantt uses the time portion to position bar edges with sub-day
+    precision (so a task finishing at 12:00 on Friday renders as a half-day,
+    not a full day). Returns '' if None."""
+    if dt is None:
+        return ''
+    try:
+        date_part = str(dt.toLocalDate().toString())
+        time_part = str(dt.toLocalTime().toString())
+        # Truncate sub-second precision; HH:MM:SS is enough for the Gantt
+        if '.' in time_part:
+            time_part = time_part.split('.')[0]
+        if len(time_part) == 5:  # HH:MM → HH:MM:00
+            time_part = time_part + ':00'
+        return f'{date_part}T{time_part}'
+    except Exception:
+        pass
+    try:
+        s = str(dt.toString()).replace(' ', 'T')
+        if 'T' in s and len(s) >= 19:
+            return s[:19]
+    except Exception:
+        pass
+    return _to_date_str(dt)
 
 
 def _date_span_days(task):
@@ -292,6 +326,52 @@ def _get_calendar_name(task):
     except Exception:
         pass
     return ''
+
+
+def _get_calendar_details(task):
+    """Return the working rules of the calendar ASSIGNED to this task.
+
+    Asta allows each task to have its own calendar (e.g. a "Concrete Cure"
+    task may run 24/7 while "Site Works" runs Monday–Friday). Returns:
+        working_days : list[int]  — day-of-week numbers that are working (0=Sun..6=Sat), or [] if unknown
+        is_24_7      : bool       — True if every day of the week is working (an elapsed/24-7 calendar)
+    """
+    try:
+        cal = task.getCalendar()
+        if cal is None:
+            return [], False
+        working = []
+        try:
+            wd = cal.getWorkingDays()
+            if wd is not None and len(wd) == 7:
+                for i, d in enumerate(wd):
+                    s = str(d.toString()).upper()
+                    if 'WORKING' in s and 'NON' not in s:
+                        working.append(i)
+        except Exception:
+            pass
+        return working, len(working) == 7
+    except Exception:
+        return [], False
+
+
+def _get_duration_type(task):
+    """Determine whether this task's duration is 'elapsed' or 'working'.
+
+    MPXJ encodes elapsed durations (which ignore calendars — e.g. concrete
+    curing that runs 24/7) with an ELAPSED_* unit. Working durations obey
+    the assigned calendar. The frontend uses this to decide whether a
+    duration counts calendar time or working time.
+    """
+    try:
+        dur = task.getDuration()
+        if dur is not None:
+            units = str(dur.getUnits().toString()).upper()
+            if 'ELAPSED' in units:
+                return 'elapsed'
+    except Exception:
+        pass
+    return 'working'
 
 
 def _extract_working_days(project):
@@ -575,6 +655,8 @@ def parse():
                 priority = _get_priority(task)
                 cost = _get_cost(task)
                 calendar_name = _get_calendar_name(task)
+                calendar_working_days, calendar_is_24_7 = _get_calendar_details(task)
+                duration_type = _get_duration_type(task)
                 notes = _get_notes(task)
                 constraint = _constraint_type(task)
                 constraint_date = _to_date_str(task.getConstraintDate())
@@ -596,6 +678,8 @@ def parse():
                     'asta_id': asta_id,
                     'mpxj_unique_id': mpxj_uid,
                     'name': str(name),
+                    # Date-only fields (YYYY-MM-DD) — kept for date columns,
+                    # calendar grouping, and backward compatibility.
                     'start_date': _to_date_str(planned_start),
                     'end_date': _to_date_str(planned_finish) or _to_date_str(planned_start),
                     'actual_start': _to_date_str(actual_start),
@@ -606,7 +690,22 @@ def parse():
                     'late_finish': _to_date_str(late_finish),
                     'baseline_start': _to_date_str(baseline_start),
                     'baseline_finish': _to_date_str(baseline_finish),
+                    # Full timestamps (YYYY-MM-DDTHH:MM:SS) — the absolute
+                    # source of truth. The frontend Gantt uses the time
+                    # portion to position bar edges with sub-day precision,
+                    # so a half-day finishing at 12:00 renders as a half-day.
+                    'start_datetime': _to_iso_exact(planned_start),
+                    'end_datetime': _to_iso_exact(planned_finish) or _to_iso_exact(planned_start),
+                    'actual_start_datetime': _to_iso_exact(actual_start),
+                    'actual_finish_datetime': _to_iso_exact(actual_finish),
+                    'early_start_datetime': _to_iso_exact(early_start),
+                    'early_finish_datetime': _to_iso_exact(early_finish),
+                    'late_start_datetime': _to_iso_exact(late_start),
+                    'late_finish_datetime': _to_iso_exact(late_finish),
+                    'baseline_start_datetime': _to_iso_exact(baseline_start),
+                    'baseline_finish_datetime': _to_iso_exact(baseline_finish),
                     'duration_days': duration_days,
+                    'duration_type': duration_type,
                     'actual_duration_days': actual_duration_days,
                     'remaining_duration_days': remaining_duration_days,
                     'percentage_complete': pct_complete,
@@ -623,6 +722,8 @@ def parse():
                     'priority': priority,
                     'cost': cost,
                     'calendar_name': calendar_name,
+                    'calendar_working_days': calendar_working_days,
+                    'calendar_is_24_7': calendar_is_24_7,
                     'notes': notes,
                     'constraint_type': constraint,
                     'constraint_date': constraint_date,
