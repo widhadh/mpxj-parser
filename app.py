@@ -345,27 +345,38 @@ def _get_notes(task):
 
 
 def _map_resource_type(res):
-    """Map MPXJ ResourceType → 'permanent' or 'temporary'.
+    """Map MPXJ ResourceType → (resource_type, category).
 
-    Asta Powerproject distinguishes permanent resources (labour, plant —
-    allocated for a duration) from consumable/temporary resources (materials —
-    consumed in quantity). MPXJ exposes this via ResourceType:
-        LABOR / EQUIPMENT → 'permanent'
-        MATERIAL          → 'temporary'  (consumable)
+    Returns a tuple:
+        resource_type : 'permanent' | 'temporary'
+            permanent  = labour/plant (allocated for a duration)
+            temporary  = material/cost (consumed in quantity)
+        category : 'people' | 'plant'
+            people = labour / work resources
+            plant  = equipment / machinery resources
+
+    MPXJ ResourceType values:
+        WORK        → permanent / people
+        LABOR/LABOUR→ permanent / people
+        EQUIPMENT   → permanent / plant
+        MATERIAL    → temporary / plant   (consumable material)
+        COST        → temporary / plant   (cost-type, treat as consumable)
     """
     try:
         rt = res.getType()
         if rt is not None:
             s = str(rt.toString()).upper()
             if 'MATERIAL' in s:
-                return 'temporary'
-            if 'LABOR' in s or 'LABOUR' in s or 'EQUIPMENT' in s or 'WORK' in s:
-                return 'permanent'
+                return ('temporary', 'plant')
+            if 'EQUIPMENT' in s:
+                return ('permanent', 'plant')
+            if 'LABOR' in s or 'LABOUR' in s or 'WORK' in s:
+                return ('permanent', 'people')
             if 'COST' in s:
-                return 'temporary'
+                return ('temporary', 'plant')
     except Exception:
         pass
-    return 'permanent'
+    return ('permanent', 'people')
 
 
 def _get_resource_assignment_units(assign):
@@ -424,7 +435,7 @@ def _get_resource_assignments(task):
     """Extract full resource assignments with type and allocated quantity.
 
     Returns a list of dicts:
-        { name, resource_type ('permanent'|'temporary'), units }
+        { name, resource_type ('permanent'|'temporary'), category ('people'|'plant'), units }
     """
     assignments_out = []
     try:
@@ -439,9 +450,11 @@ def _get_resource_assignments(task):
                 name = str(res.getName())
                 if not name:
                     continue
+                rtype, category = _map_resource_type(res)
                 assignments_out.append({
                     'name': name,
-                    'resource_type': _map_resource_type(res),
+                    'resource_type': rtype,
+                    'category': category,
                     'units': _get_resource_assignment_units(assign),
                 })
             except Exception:
