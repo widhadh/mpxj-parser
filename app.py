@@ -212,9 +212,14 @@ def _get_outline_level(task):
 
 
 def _get_parent_uid(task):
+    """Return the parent's Asta UTID (getID()) so it matches the child's asta_id.
+    Falls back to the internal MPXJ UniqueID if the UTID is unavailable."""
     try:
         parent = task.getParentTask()
         if parent is not None:
+            utid = _safe_str(parent.getID())
+            if utid:
+                return utid
             return str(parent.getUniqueID())
     except Exception:
         pass
@@ -316,8 +321,9 @@ def _extract_baselines(project):
             bl_tasks = []
             try:
                 for t in bl_project.getTasks():
+                    utid = _safe_str(t.getID())
                     bl_tasks.append({
-                        'aid': str(t.getUniqueID()),
+                        'aid': utid if utid else str(t.getUniqueID()),
                         'sd': _to_date_str(t.getStart()),
                         'ed': _to_date_str(t.getFinish()),
                         'od': _to_date_str(t.getStart()),
@@ -436,7 +442,7 @@ def parse():
                     'is_summary': is_summary,
                     'is_milestone': is_milestone,
                     'is_critical': is_critical,
-                    'predecessor_asta_id': first_pred['pred_unique_id'] if first_pred else '',
+                    'predecessor_asta_id': first_pred['pred_id'] if first_pred else '',
                     'link_type': first_pred['link_type'] if first_pred else 'FS',
                     'lag_days': first_pred['lag_days'] if first_pred else 0,
                     'all_predecessors': predecessors,
