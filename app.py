@@ -152,6 +152,74 @@ def parse():
 
         all_dates = sorted([d for info in ordered for d in [info['start_date'], info['end_date']] if d])
 
+        # ── Extract embedded baselines (Asta PP files can contain multiple) ──
+        baselines = []
+        try:
+            baseline_projects = project.getBaselines()
+            if baseline_projects:
+                for idx, bl_project in enumerate(baseline_projects):
+                    # Baseline name
+                    bl_name = f'Baseline {idx + 1}'
+                    try:
+                        props = bl_project.getProjectProperties()
+                        if props and props.getName():
+                            bl_name = str(props.getName())
+                    except:
+                        pass
+
+                    # Baseline date
+                    bl_date = None
+                    try:
+                        props = bl_project.getProjectProperties()
+                        if props and props.getStartDate():
+                            bl_date = str(props.getStartDate().toString())[:10]
+                    except:
+                        pass
+
+                    # Snapshot of task dates
+                    bl_tasks = []
+                    try:
+                        for task in bl_project.getTasks():
+                            task_id = str(task.getID()) if task.getID() else str(task.getUniqueID())
+                            sd = ''
+                            ed = ''
+                            try:
+                                start = task.getStart()
+                                if start:
+                                    sd = str(start.toString())[:10]
+                            except:
+                                pass
+                            try:
+                                finish = task.getFinish()
+                                if finish:
+                                    ed = str(finish.toString())[:10]
+                            except:
+                                pass
+                            if task_id and (sd or ed):
+                                bl_tasks.append({
+                                    'aid': task_id,
+                                    'sd': sd,
+                                    'ed': ed,
+                                    'od': sd,
+                                })
+                    except:
+                        pass
+
+                    baselines.append({
+                        'name': bl_name,
+                        'date': bl_date,
+                        'tasks': bl_tasks,
+                    })
+        except Exception as e:
+            print(f'Error reading baselines: {e}')
+
+        # ── Return response with baselines ──
+        return jsonify({
+            'activities': ordered,
+            'project_start': all_dates[0] if all_dates else None,
+            'project_end': all_dates[-1] if all_dates else None,
+            'baselines': baselines,
+        })
         return jsonify({
             'activities': ordered,
             'project_start': all_dates[0] if all_dates else None,
