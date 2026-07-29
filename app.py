@@ -7,32 +7,24 @@ import traceback
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 
+# 1. Let the official pip packages handle the heavy lifting!
+import jpype
+import mpxj
+
+# 2. Start the JVM using mpxj's automatic configuration
+jpype.startJVM()
+from jpype import isThreadAttachedToJVM, attachThreadToJVM
+
+# 3. Import the native Java classes safely
+from org.mpxj.reader import UniversalProjectReader
+from org.mpxj import TaskType, RelationType
+
 app = Flask(__name__)
 CORS(app)
 
-# ── Download MPXJ JAR if not present ────────────────────────────────────────
-# CHANGED: Now saves to /app/mpxj.jar instead of /opt/ to avoid Docker Permission Denied errors
-MPXJ_JAR_PATH = os.environ.get('MPXJ_JAR_PATH', '/app/mpxj.jar')
-MPXJ_VERSION = os.environ.get('MPXJ_VERSION', '15.0.0')
-MPXJ_JAR_URL = f'https://repo1.maven.org/maven2/net/sf/mpxj/mpxj/{MPXJ_VERSION}/mpxj-{MPXJ_VERSION}.jar'
-
-if not os.path.exists(MPXJ_JAR_PATH):
-    os.makedirs(os.path.dirname(MPXJ_JAR_PATH), exist_ok=True)
-    import urllib.request
-    print(f'Downloading MPXJ {MPXJ_VERSION} from {MPXJ_JAR_URL}...')
-    urllib.request.urlretrieve(MPXJ_JAR_URL, MPXJ_JAR_PATH)
-    print(f'Saved to {MPXJ_JAR_PATH}')
-
-from jpype import JClass, JString, startJVM, isThreadAttachedToJVM, attachThreadToJVM
-
-startJVM(classpath=MPXJ_JAR_PATH, convertStrings=False)
-
-UniversalProjectReader = JClass('net.sf.mpxj.reader.UniversalProjectReader')
-TaskType = JClass('net.sf.mpxj.TaskType')
-RelationType = JClass('net.sf.mpxj.RelationType')
-
 
 def attach_jvm():
+    """Ensure the current web request thread is attached to the JVM"""
     if not isThreadAttachedToJVM():
         attachThreadToJVM()
 
@@ -311,7 +303,7 @@ def parse_file():
         tmp.close()
         try:
             reader = UniversalProjectReader()
-            project = reader.read(JString(tmp.name))
+            project = reader.read(str(tmp.name))
         except Exception as e:
             if 'password' in str(e).lower() or 'protect' in str(e).lower():
                 return jsonify({'error': 'File is password-protected. Remove protection in Asta and re-upload.'}), 422
@@ -380,4 +372,5 @@ def health():
 
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 5000)))
+    # Default to 8000 for standard web deployments
+    app.run(host='0.0.0.0', port=int(os.environ.get('PORT', 8000)))
