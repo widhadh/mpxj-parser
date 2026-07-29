@@ -70,59 +70,65 @@ def _to_date_str(dt):
     return ''
 
 
-def _get_duration_days(task):
-    try:
-        dur = task.getDuration()
-        if dur is not None:
-            val = dur.getDuration()
-            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
-            if val:
-                if 'HOUR' in units:
-                    return max(1, round(val / 8))
-                if val > 0:
-                    return int(val)
-    except Exception:
-        pass
-    # Fallback: compute from start/finish
+def _date_span_days(task):
+    """Return the inclusive calendar-day span from start to finish, or None."""
     try:
         start = task.getStart()
         finish = task.getFinish()
         if start is not None and finish is not None:
             delta = (finish.toLocalDate().toEpochDay() - start.toLocalDate().toEpochDay()) + 1
-            return max(1, int(delta))
+            if delta > 0:
+                return int(delta)
     except Exception:
         pass
-    return 1
+    return None
 
 
-def _get_actual_duration_days(task):
+def _mpxj_duration_to_days(dur):
+    """Convert an MPXJ Duration object to whole days, handling hours."""
+    if dur is None:
+        return None
     try:
-        dur = task.getActualDuration()
-        if dur is not None:
-            val = dur.getDuration()
-            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
-            if val:
-                if 'HOUR' in units:
-                    return max(0, round(val / 8))
-                return int(val)
+        val = dur.getDuration()
+        if not val or val <= 0:
+            return None
+        try:
+            units = str(dur.getUnits().toString()).upper()
+        except Exception:
+            units = ''
+        if 'HOUR' in units:
+            return max(1, round(val / 8))
+        if 'MINUTE' in units:
+            return max(1, round(val / 60 / 8))
+        return max(1, int(val))
     except Exception:
-        pass
+        return None
+
+
+def _get_duration_days(task):
+    """Duration in calendar days, derived from the start→finish date span
+    (which matches what the Gantt displays). Falls back to the MPXJ duration
+    value (converting hours→days) only when no dates are available."""
+    span = _date_span_days(task)
+    if span:
+        return span
+    days = _mpxj_duration_to_days(task.getDuration())
+    return days if days else 1
+
+
+def _get_actual_duration_days(task, duration_days):
+    """Actual worked days, derived from percentage complete so it's always
+    consistent with duration_days (never in hours)."""
+    pct = _get_percentage_complete(task)
+    if pct >= 100:
+        return duration_days
+    if pct > 0:
+        return round(duration_days * pct / 100)
     return 0
 
 
-def _get_remaining_duration_days(task):
-    try:
-        dur = task.getRemainingDuration()
-        if dur is not None:
-            val = dur.getDuration()
-            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
-            if val:
-                if 'HOUR' in units:
-                    return max(0, round(val / 8))
-                return int(val)
-    except Exception:
-        pass
-    return 0
+def _get_remaining_duration_days(duration_days, actual_duration_days):
+    return max(0, duration_days - actual_duration_days)
 
 
 def _get_predecessors(task):
@@ -212,14 +218,10 @@ def _get_outline_level(task):
 
 
 def _get_parent_uid(task):
-    """Return the parent's Asta UTID (getID()) so it matches the child's asta_id.
-    Falls back to the internal MPXJ UniqueID if the UTID is unavailable."""
+    """Return the parent's Asta UTID (getUniqueID()) so it matches the child's asta_id."""
     try:
         parent = task.getParentTask()
         if parent is not None:
-            utid = _safe_str(parent.getID())
-            if utid:
-                return utid
             return str(parent.getUniqueID())
     except Exception:
         pass
@@ -321,9 +323,8 @@ def _extract_baselines(project):
             bl_tasks = []
             try:
                 for t in bl_project.getTasks():
-                    utid = _safe_str(t.getID())
                     bl_tasks.append({
-                        'aid': utid if utid else str(t.getUniqueID()),
+                        'aid': str(t.getUniqueID()),
                         'sd': _to_date_str(t.getStart()),
                         'ed': _to_date_str(t.getFinish()),
                         'od': _to_date_str(t.getStart()),
@@ -367,10 +368,11 @@ def parse():
                     continue
 
                 # ── IDs ──────────────────────────────────────────────────────
-                # getID() = Asta UTID (user-visible task identifier)
-                # getUniqueID() = internal MPXJ unique sequence number
-                asta_utid = _safe_str(task.getID())
-                mpxj_uid = str(task.getUniqueID())
+                # getUniqueID() = Asta UTID (permanent unique task identifier
+                #   that never changes — the real "Unique Task ID" from Asta)
+                # getID() = sequential display/row ID (renumbered by MPXJ)
+                asta_utid = str(task.getUniqueID())
+                mpxj_uid = _safe_str(task.getID())
 
                 # ── Dates ─────────────────────────────────────────────────────
                 planned_start = task.getStart()
@@ -415,6 +417,11 @@ def parse():
                 # ── Status from actuals ─────────────────────────────────────
                 status = _compute_status(task, pct_complete, actual_start, actual_finish)
 
+                # ── Durations (all derived in calendar days, never hours) ──
+                duration_days = _get_duration_days(task)
+                actual_duration_days = _get_actual_duration_days(task, duration_days)
+                remaining_duration_days = _get_remaining_duration_days(duration_days, actual_duration_days)
+
                 # Use the Asta UTID as the primary asta_id, fallback to UniqueID
                 asta_id = asta_utid if asta_utid else mpxj_uid
 
@@ -432,9 +439,9 @@ def parse():
                     'late_finish': _to_date_str(late_finish),
                     'baseline_start': _to_date_str(baseline_start),
                     'baseline_finish': _to_date_str(baseline_finish),
-                    'duration_days': _get_duration_days(task),
-                    'actual_duration_days': _get_actual_duration_days(task),
-                    'remaining_duration_days': _get_remaining_duration_days(task),
+                    'duration_days': duration_days,
+                    'actual_duration_days': actual_duration_days,
+                    'remaining_duration_days': remaining_duration_days,
                     'percentage_complete': pct_complete,
                     'status': status,
                     'wbs_level': outline_level,
@@ -442,7 +449,7 @@ def parse():
                     'is_summary': is_summary,
                     'is_milestone': is_milestone,
                     'is_critical': is_critical,
-                    'predecessor_asta_id': first_pred['pred_id'] if first_pred else '',
+                    'predecessor_asta_id': first_pred['pred_unique_id'] if first_pred else '',
                     'link_type': first_pred['link_type'] if first_pred else 'FS',
                     'lag_days': first_pred['lag_days'] if first_pred else 0,
                     'all_predecessors': predecessors,
