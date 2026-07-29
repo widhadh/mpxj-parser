@@ -1,25 +1,32 @@
 """
 MPXJ Microservice — parses native Asta Powerproject (.pp) files using the
-open-source MPXJ library and returns structured JSON.
+open-source MPXJ Java library via JPype, returns structured JSON.
 
 Deploy to Render / any Python host:
   pip install -r requirements.txt
-  python app.py
+  gunicorn -w 2 -b 0.0.0.0:5000 --timeout 120 app:app
 
 Exposes:
   POST /parse  (multipart/form-data, field: file)  →  JSON { activities, baselines }
 """
 
 import os
-import io
 import traceback
+
+import jpype
+import mpxj
+
+# Start the JVM once at module import — each gunicorn worker runs this independently
+jpype.startJVM()
+
+from org.mpxj.reader import UniversalProjectReader
+
 from flask import Flask, request, jsonify
-from mpxj.reader import MPXJReader
 
 app = Flask(__name__)
 
+
 # ── Link type mapping ─────────────────────────────────────────────────────────
-# MPXJ RelationType enum → our canonical FS/SS/FF/SF
 LINK_TYPE_MAP = {
     'FINISH_START': 'FS',
     'START_START': 'SS',
@@ -29,81 +36,87 @@ LINK_TYPE_MAP = {
 
 
 def _safe_str(val):
-    """Safely convert any value to string, returning '' for None."""
     if val is None:
         return ''
     return str(val)
 
 
 def _to_date_str(dt):
-    """Convert a datetime to YYYY-MM-DD string, or '' if None."""
+    """Convert a Java LocalDateTime / Date to YYYY-MM-DD, or '' if None."""
     if dt is None:
         return ''
     try:
-        return dt.strftime('%Y-%m-%d')
-    except (AttributeError, ValueError):
-        return ''
+        # LocalDateTime → toLocalDate() → "2003-01-01"
+        return str(dt.toLocalDate().toString())
+    except Exception:
+        pass
+    try:
+        s = str(dt.toString())
+        if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+            return s[:10]
+    except Exception:
+        pass
+    return ''
 
 
 def _get_duration_days(task):
-    """Extract duration in days from a task, with fallback to date range."""
     try:
-        dur = task.get_duration()
+        dur = task.getDuration()
         if dur is not None:
-            val = dur.get_duration()
-            units = str(dur.get_units()) if hasattr(dur, 'get_units') else ''
-            # MPXJ returns duration in hours by default for many formats
-            if 'HOUR' in units.upper() and val:
-                return max(1, round(val / 8))
-            if val and val > 0:
-                return val
+            val = dur.getDuration()
+            units = str(dur.getUnits().toString()).upper() if hasattr(dur, 'getUnits') else ''
+            if val:
+                if 'HOUR' in units:
+                    return max(1, round(val / 8))
+                if val > 0:
+                    return int(val)
     except Exception:
         pass
     # Fallback: compute from start/finish
     try:
-        start = task.get_start()
-        finish = task.get_finish()
-        if start and finish:
-            delta = (finish - start).days + 1
-            return max(1, delta)
+        start = task.getStart()
+        finish = task.getFinish()
+        if start is not None and finish is not None:
+            delta = (finish.toLocalDate().toEpochDay() - start.toLocalDate().toEpochDay()) + 1
+            return max(1, int(delta))
     except Exception:
         pass
     return 1
 
 
-def _get_predecessor_info(task, task_by_uid):
-    """Extract the first predecessor link from a task.
-    Returns (predecessor_id, link_type, lag_days)."""
+def _get_predecessor_info(task):
+    """Extract the first predecessor link. Returns (pred_uid, link_type, lag_days)."""
     try:
-        preds = task.get_predecessors()
+        preds = task.getPredecessors()
         if not preds:
             return '', 'FS', 0
         for pred in preds:
-            pred_task = pred.get_predecessor_task()
+            pred_task = pred.getPredecessorTask()
             if pred_task is None:
                 continue
-            pred_uid = str(pred_task.get_unique_id())
-            # Map link type
-            link_type_raw = str(pred.get_type())
+            pred_uid = str(pred_task.getUniqueID())
+
+            link_type_raw = str(pred.getType())
             link_type = 'FS'
             for key, val in LINK_TYPE_MAP.items():
                 if key in link_type_raw.upper():
                     link_type = val
                     break
-            # Extract lag
+
             lag_days = 0
             try:
-                lag = pred.get_lag()
+                lag = pred.getLag()
                 if lag is not None:
-                    lag_val = lag.get_duration()
-                    lag_units = str(lag.get_units()) if hasattr(lag, 'get_units') else ''
+                    lag_val = lag.getDuration()
+                    lag_units = str(lag.getUnits().toString()).upper() if hasattr(lag, 'getUnits') else ''
                     if lag_val:
-                        if 'HOUR' in lag_units.upper():
+                        if 'HOUR' in lag_units:
                             lag_days = round(lag_val / 8)
                         else:
-                            lag_days = lag_val
+                            lag_days = int(lag_val)
             except Exception:
                 pass
+
             return pred_uid, link_type, lag_days
     except Exception:
         pass
@@ -111,9 +124,8 @@ def _get_predecessor_info(task, task_by_uid):
 
 
 def _is_summary_task(task):
-    """Determine if a task is a summary task."""
     try:
-        val = task.get_summary()
+        val = task.getSummary()
         if val is not None:
             return bool(val)
     except Exception:
@@ -122,9 +134,8 @@ def _is_summary_task(task):
 
 
 def _get_outline_level(task):
-    """Get the WBS/outline level for a task."""
     try:
-        level = task.get_outline_level()
+        level = task.getOutlineLevel()
         if level is not None:
             return str(level)
     except Exception:
@@ -133,39 +144,44 @@ def _get_outline_level(task):
 
 
 def _get_parent_uid(task):
-    """Get the unique ID of the parent task, if any."""
     try:
-        parent = task.get_parent_task()
+        parent = task.getParentTask()
         if parent is not None:
-            return str(parent.get_unique_id())
+            return str(parent.getUniqueID())
     except Exception:
         pass
     return ''
 
 
 def _extract_baselines(project):
-    """Extract baseline snapshots from the project."""
     baselines = []
     try:
-        bl_list = project.get_baselines()
-        if not bl_list:
+        bl_map = project.getBaselines()
+        if not bl_map:
             return baselines
-        for bl in bl_list:
+        for entry in bl_map.entrySet():
+            bl_project = entry.getValue()
+            if bl_project is None:
+                continue
             bl_tasks = []
             try:
-                for t in bl.get_tasks():
+                for t in bl_project.getTasks():
                     bl_tasks.append({
-                        'aid': str(t.get_unique_id()),
-                        'sd': _to_date_str(t.get_start()),
-                        'ed': _to_date_str(t.get_finish()),
-                        'od': _to_date_str(t.get_start()),
+                        'aid': str(t.getUniqueID()),
+                        'sd': _to_date_str(t.getStart()),
+                        'ed': _to_date_str(t.getFinish()),
+                        'od': _to_date_str(t.getStart()),
                     })
             except Exception:
                 pass
             if bl_tasks:
+                try:
+                    name = str(bl_project.getProjectProperties().getName()) or f'Baseline {len(baselines) + 1}'
+                except Exception:
+                    name = f'Baseline {len(baselines) + 1}'
                 baselines.append({
-                    'name': _safe_str(bl.get_name()) or f'Baseline {len(baselines) + 1}',
-                    'date': _to_date_str(bl.get_start()),
+                    'name': name,
+                    'date': _to_date_str(bl_project.getProjectProperties().getStartDate()),
                     'tasks': bl_tasks,
                 })
     except Exception:
@@ -183,38 +199,32 @@ def parse():
 
     try:
         uploaded_file.save(tmp_path)
-        project = MPXJReader.read(tmp_path)
+        project = UniversalProjectReader().read(tmp_path)
 
-        tasks = list(project.get_tasks())
-        task_by_uid = {}
-        for t in tasks:
-            try:
-                task_by_uid[str(t.get_unique_id())] = t
-            except Exception:
-                pass
+        tasks = list(project.getTasks())
 
         activities = []
         for task in tasks:
             try:
-                name = task.get_name()
+                name = task.getName()
                 if not name:
                     continue
 
-                uid = str(task.get_unique_id())
-                start = task.get_start()
-                finish = task.get_finish()
+                uid = str(task.getUniqueID())
+                start = task.getStart()
+                finish = task.getFinish()
 
                 # Skip the project summary task (root level, no dates)
-                if not start and not finish:
+                if start is None and finish is None:
                     continue
 
                 parent_uid = _get_parent_uid(task)
                 is_summary = _is_summary_task(task)
-                predecessor_id, link_type, lag_days = _get_predecessor_info(task, task_by_uid)
+                predecessor_id, link_type, lag_days = _get_predecessor_info(task)
 
                 activities.append({
                     'asta_id': uid,
-                    'name': name,
+                    'name': str(name),
                     'start_date': _to_date_str(start),
                     'end_date': _to_date_str(finish) or _to_date_str(start),
                     'duration_days': _get_duration_days(task),
@@ -230,7 +240,6 @@ def parse():
 
         baselines = _extract_baselines(project)
 
-        # Compute project date range
         all_starts = [a['start_date'] for a in activities if a['start_date']]
         all_ends = [a['end_date'] for a in activities if a['end_date']]
         project_start = min(all_starts) if all_starts else None
