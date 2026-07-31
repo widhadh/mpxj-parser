@@ -671,6 +671,26 @@ def parse():
                 actual_duration_days = _get_actual_duration_days(task, duration_days)
                 remaining_duration_days = _get_remaining_duration_days(duration_days, actual_duration_days)
 
+                # Date-only + full timestamp strings. A milestone is a
+                # zero-duration point event, so collapse end→start and force
+                # duration to 0; the Gantt renders a single diamond at the
+                # event instant. Asta places the event at the start of the
+                # working day (8am) for start milestones and the end of the
+                # working day (5pm) for finish milestones — a milestone's
+                # start and finish are the same instant, so preserving
+                # planned_start captures the correct event time for both.
+                start_date_str = _to_date_str(planned_start)
+                start_dt = _to_iso_exact(planned_start)
+                if is_milestone:
+                    duration_days = 0
+                    actual_duration_days = 0
+                    remaining_duration_days = 0
+                    end_date_str = start_date_str
+                    end_dt = start_dt
+                else:
+                    end_date_str = _to_date_str(planned_finish) or start_date_str
+                    end_dt = _to_iso_exact(planned_finish) or start_dt
+
                 # Use the Asta UTID as the primary asta_id, fallback to UniqueID
                 asta_id = asta_utid if asta_utid else mpxj_uid
 
@@ -680,8 +700,8 @@ def parse():
                     'name': str(name),
                     # Date-only fields (YYYY-MM-DD) — kept for date columns,
                     # calendar grouping, and backward compatibility.
-                    'start_date': _to_date_str(planned_start),
-                    'end_date': _to_date_str(planned_finish) or _to_date_str(planned_start),
+                    'start_date': start_date_str,
+                    'end_date': end_date_str,
                     'actual_start': _to_date_str(actual_start),
                     'actual_finish': _to_date_str(actual_finish),
                     'early_start': _to_date_str(early_start),
@@ -694,8 +714,8 @@ def parse():
                     # source of truth. The frontend Gantt uses the time
                     # portion to position bar edges with sub-day precision,
                     # so a half-day finishing at 12:00 renders as a half-day.
-                    'start_datetime': _to_iso_exact(planned_start),
-                    'end_datetime': _to_iso_exact(planned_finish) or _to_iso_exact(planned_start),
+                    'start_datetime': start_dt,
+                    'end_datetime': end_dt,
                     'actual_start_datetime': _to_iso_exact(actual_start),
                     'actual_finish_datetime': _to_iso_exact(actual_finish),
                     'early_start_datetime': _to_iso_exact(early_start),
