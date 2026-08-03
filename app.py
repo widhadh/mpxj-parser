@@ -555,6 +555,55 @@ def _compute_status(task, pct_complete, actual_start, actual_finish):
     return 'pending'
 
 
+def _extract_calendar_exceptions(project):
+    """Collect non-working calendar exception dates (bank holidays) observed
+    by the uploaded programme's calendars.
+
+    Returns a sorted list of unique ISO date strings (YYYY-MM-DD). A
+    programme that does not observe bank holidays has no non-working
+    exceptions -> empty list. The frontend uses this set instead of a
+    hardcoded UK bank-holiday list so the calendar matches the upload,
+    including the use OR non-use of bank holidays.
+    """
+    exceptions = set()
+    try:
+        cals = list(project.getCalendars())
+    except Exception:
+        return []
+    for cal in cals:
+        try:
+            excs = cal.getCalendarExceptions()
+        except Exception:
+            excs = None
+        if not excs:
+            continue
+        for exc in excs:
+            try:
+                # MPXJ returns either LocalDateRange (old API) or
+                # ProjectCalendarException (new API, exposes getRange()).
+                try:
+                    rng = exc.getRange()
+                except Exception:
+                    rng = exc
+                start = rng.getStart()
+                end = rng.getEnd()
+                d = start
+                while d.compareTo(end) <= 0:
+                    try:
+                        working = cal.isWorking(d)
+                    except Exception:
+                        working = None
+                    # A non-working exception (e.g. a bank holiday) overrides
+                    # an otherwise-working weekday. Working exceptions
+                    # (e.g. a weekend made working) are skipped.
+                    if working is False:
+                        exceptions.add(str(d.toString()))
+                    d = d.plusDays(1)
+            except Exception:
+                continue
+    return sorted(exceptions)
+
+
 def _extract_baselines(project):
     baselines = []
     try:
@@ -761,6 +810,7 @@ def parse():
         project_end = max(all_ends) if all_ends else None
 
         working_days = _extract_working_days(project)
+        calendar_exceptions = _extract_calendar_exceptions(project)
 
         return jsonify({
             'activities': activities,
@@ -768,6 +818,7 @@ def parse():
             'project_end': project_end,
             'baselines': baselines,
             'working_days': working_days,
+            'calendar_exceptions': calendar_exceptions,
         })
 
     except Exception as e:
