@@ -11,7 +11,10 @@ Exposes:
 """
 
 import os
+import re
+import sqlite3
 import traceback
+from datetime import datetime, timedelta
 
 import jpype
 import mpxj
@@ -604,6 +607,97 @@ def _extract_calendar_exceptions(project):
     return sorted(exceptions)
 
 
+def _parse_ast_date(value):
+    """Parse a date value from an Asta SQLite column into YYYY-MM-DD.
+
+    Asta .pp SQLite stores dates as strings in 'yyyy-MM-dd HH:mm:ss' format
+    (per MPXJ's SQLite date_string_format). Some columns/older files may store
+    integers (Asta epoch seconds from 1990-01-01) — handle both.
+    """
+    if value is None:
+        return ''
+    s = str(value).strip()
+    if not s:
+        return ''
+    # ISO-like string: take the date part directly
+    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
+        return s[:10]
+    # Pure integer — try Asta epoch (seconds from 1990-01-01), then unix seconds/ms
+    if s.isdigit():
+        n = int(s)
+        for epoch, scale in ((datetime(1990, 1, 1), 1), (datetime(1970, 1, 1), 1), (datetime(1970, 1, 1), 0.001)):
+            try:
+                d = epoch + timedelta(seconds=n * scale)
+                if 1990 <= d.year <= 2100:
+                    return d.strftime('%Y-%m-%d')
+            except Exception:
+                pass
+    # Excel serial (5-digit)
+    if re.match(r'^\d{5,6}$', s):
+        try:
+            d = datetime(1899, 12, 30) + timedelta(days=int(s))
+            if 1990 <= d.year <= 2100:
+                return d.strftime('%Y-%m-%d')
+        except Exception:
+            pass
+    return s[:10]
+
+
+def _extract_progress_periods(tmp_path):
+    """Read the progress_period table directly from the .pp SQLite database.
+
+    Asta Powerproject stores named progress periods (each with a report/data
+    date) in a 'progress_period' table, and the currently selected period in
+    the 'userr' table (CURRENT_PROGRESS_PERIOD column). MPXJ only exposes the
+    selected period's date via the project status date, so we read the full
+    list ourselves to let the user choose which period to view.
+
+    Returns (periods, current_period_id):
+        periods: list of {id, name, date} sorted by date ascending
+        current_period_id: the file's selected progress period ID (string or None)
+    """
+    periods = []
+    current_id = None
+    try:
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
+        try:
+            rows = conn.execute('SELECT * FROM progress_period').fetchall()
+        except Exception:
+            rows = []
+        for i, r in enumerate(rows):
+            d = dict(r)
+            rid = d.get('ID')
+            date_str = _parse_ast_date(d.get('REPORT_DATE'))
+            name = (
+                d.get('NAME')
+                or d.get('SHORT_NAME')
+                or d.get('DESCRIPTION')
+                or d.get('TITLE')
+                or d.get('PERIOD_NAME')
+                or f'Period {i + 1}'
+            )
+            periods.append({
+                'id': str(rid) if rid is not None else str(i + 1),
+                'name': str(name),
+                'date': date_str,
+            })
+        try:
+            userr = conn.execute('SELECT * FROM userr LIMIT 1').fetchone()
+            if userr:
+                cp = dict(userr).get('CURRENT_PROGRESS_PERIOD')
+                if cp is not None:
+                    current_id = str(cp)
+        except Exception:
+            pass
+        conn.close()
+    except Exception:
+        pass
+    # Sort by date ascending (empty dates sort first)
+    periods.sort(key=lambda p: p['date'] or '')
+    return periods, current_id
+
+
 def _extract_baselines(project):
     baselines = []
     try:
@@ -811,6 +905,7 @@ def parse():
 
         working_days = _extract_working_days(project)
         calendar_exceptions = _extract_calendar_exceptions(project)
+        progress_periods, current_progress_period_id = _extract_progress_periods(tmp_path)
 
         return jsonify({
             'activities': activities,
@@ -819,6 +914,8 @@ def parse():
             'baselines': baselines,
             'working_days': working_days,
             'calendar_exceptions': calendar_exceptions,
+            'progress_periods': progress_periods,
+            'current_progress_period_id': current_progress_period_id,
         })
 
     except Exception as e:
