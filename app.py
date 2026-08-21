@@ -24,8 +24,9 @@ import mpxj
 jpype.startJVM()
 
 from org.mpxj.reader import UniversalProjectReader
-from net.sf.mpxj.mspdi import MSPDIWriter
-from java.time import LocalDateTime
+
+# MSPDIWriter + LocalDateTime are resolved lazily inside /export via jpype.JClass
+# so a missing writer class never breaks service startup (and never breaks /parse).
 
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
@@ -981,6 +982,8 @@ def export():
             if uid:
                 override_by_uid[uid] = o
 
+        LocalDateTime = jpype.JClass('java.time.LocalDateTime')
+
         def _parse_ldt(s):
             if not s:
                 return None
@@ -1031,6 +1034,18 @@ def export():
             except Exception:
                 continue
 
+        # Resolve the MSPDI writer class lazily. The bundled MPXJ jar exposes
+        # classes under org.mpxj (mirroring the reader import above); fall back to
+        # the net.sf.mpxj namespace in case a different jar build is in use.
+        MSPDIWriter = None
+        for cls_name in ('org.mpxj.mspdi.MSPDIWriter', 'net.sf.mpxj.mspdi.MSPDIWriter'):
+            try:
+                MSPDIWriter = jpype.JClass(cls_name)
+                break
+            except Exception:
+                continue
+        if MSPDIWriter is None:
+            raise RuntimeError('MSPDIWriter class not found on the MPXJ classpath (no MSPDI writer jar available).')
         MSPDIWriter().write(project, out_path)
         return send_file(out_path, as_attachment=True, download_name=f'{base}.xml', mimetype='application/xml')
     except Exception as e:
