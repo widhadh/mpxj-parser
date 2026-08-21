@@ -551,6 +551,173 @@ def _get_resource_assignments(task):
     return assignments_out
 
 
+def _get_activity_codes(task):
+    """Return the Asta Powerproject code-library assignments for this task as
+    a dict {library_name: code_value_name}.
+
+    MPXJ's AstaReader maps Powerproject code libraries to its ActivityCode /
+    ActivityCodeValue model. Task.getActivityCodeValues() returns a Map
+    keyed by ActivityCode (the library) whose value is the assigned
+    ActivityCodeValue (the code). A task normally carries one value per
+    library; if a library appears multiple times the values are joined
+    with ', '. Returns {} when the schedule defines no code libraries or
+    the MPXJ build does not expose the method.
+    """
+    codes = {}
+    try:
+        acv_map = task.getActivityCodeValues()
+        if not acv_map:
+            return codes
+        for entry in acv_map.entrySet():
+            try:
+                ac = entry.getKey()
+                val = entry.getValue()
+                if ac is None or val is None:
+                    continue
+                lib = str(ac.getName() or '').strip()
+                vname = str(val.getName() or '').strip()
+                if not lib or not vname:
+                    continue
+                if lib in codes:
+                    parts = [p.strip() for p in codes[lib].split(',')]
+                    if vname not in parts:
+                        codes[lib] = codes[lib] + ', ' + vname
+                else:
+                    codes[lib] = vname
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return codes
+
+
+def _get_successors(task):
+    """Extract ALL successor (dependent) links — the mirror of
+    _get_predecessors. MPXJ Task.getSuccessors() returns the relations where
+    this task is the predecessor; each relation's getSuccessorTask() is the
+    downstream task that depends on this one."""
+    links = []
+    try:
+        succs = task.getSuccessors()
+        if not succs:
+            return links
+        for succ in succs:
+            succ_task = succ.getSuccessorTask()
+            if succ_task is None:
+                continue
+            succ_uid = _get_asta_utid(succ_task)
+            succ_id = str(succ_task.getID())
+            link_type_raw = str(succ.getType())
+            link_type = 'FS'
+            for key, val in LINK_TYPE_MAP.items():
+                if key in link_type_raw.upper():
+                    link_type = val
+                    break
+            lag_days = 0
+            try:
+                lag = succ.getLag()
+                if lag is not None:
+                    lag_val = lag.getDuration()
+                    lag_units = str(lag.getUnits().toString()).upper() if hasattr(lag, 'getUnits') else ''
+                    if lag_val:
+                        if 'HOUR' in lag_units:
+                            lag_days = round(lag_val / 8)
+                        else:
+                            lag_days = int(lag_val)
+            except Exception:
+                pass
+            links.append({
+                'succ_unique_id': succ_uid,
+                'succ_id': succ_id,
+                'link_type': link_type,
+                'lag_days': lag_days,
+            })
+    except Exception:
+        pass
+    return links
+
+
+def _get_total_float_days(task):
+    """Total float / total slack in whole days — how long the task can slip
+    without delaying the project. A task with zero total float is critical.
+    MPXJ Task.getTotalSlack() returns a Duration."""
+    try:
+        dur = task.getTotalSlack()
+        if dur is None:
+            return 0
+        d = _mpxj_duration_to_days(dur)
+        return d if d else 0
+    except Exception:
+        return 0
+
+
+def _get_free_float_days(task):
+    """Free float / free slack in whole days — how long the task can slip
+    without delaying any successor. MPXJ Task.getFreeSlack()."""
+    try:
+        dur = task.getFreeSlack()
+        if dur is None:
+            return 0
+        d = _mpxj_duration_to_days(dur)
+        return d if d else 0
+    except Exception:
+        return 0
+
+
+def _get_task_type(task):
+    """Task type (Fixed Duration / Fixed Work / Fixed Units). Asta's
+    'duration type' maps to these MPXJ TaskType values."""
+    try:
+        t = task.getType()
+        if t is not None:
+            return str(t.toString())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_wbs_code(task):
+    """WBS code path string (e.g. '1.2.3') — distinct from the outline level
+    number. MPXJ Task.getWBS()."""
+    try:
+        w = task.getWBS()
+        if w is not None:
+            return str(w)
+    except Exception:
+        pass
+    return ''
+
+
+def _get_actual_cost(task):
+    try:
+        c = task.getActualCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_remaining_cost(task):
+    try:
+        c = task.getRemainingCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_baseline_cost(task):
+    try:
+        c = task.getBaselineCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
 def _compute_status(task, pct_complete, actual_start, actual_finish):
     """Derive a status from MPXJ actuals + percentage complete."""
     if pct_complete >= 100:
@@ -854,6 +1021,17 @@ def parse():
                 # Use the Asta UTID as the primary asta_id, fallback to UniqueID
                 asta_id = asta_utid if asta_utid else mpxj_uid
 
+                # ── Successors, float, type, WBS code, cost detail ─────────────
+                successors = _get_successors(task)
+                first_succ = successors[0] if successors else None
+                total_float_days = _get_total_float_days(task)
+                free_float_days = _get_free_float_days(task)
+                task_type = _get_task_type(task)
+                wbs_code = _get_wbs_code(task)
+                actual_cost = _get_actual_cost(task)
+                remaining_cost = _get_remaining_cost(task)
+                baseline_cost = _get_baseline_cost(task)
+
                 activities.append({
                     'asta_id': asta_id,
                     'mpxj_unique_id': mpxj_uid,
@@ -909,6 +1087,16 @@ def parse():
                     'constraint_date': constraint_date,
                     'resources': resources,
                     'resource_assignments': resource_assignments,
+                    'activity_codes': _get_activity_codes(task),
+                    'all_successors': successors,
+                    'successor_asta_id': first_succ['succ_unique_id'] if first_succ else '',
+                    'total_float_days': total_float_days,
+                    'free_float_days': free_float_days,
+                    'task_type': task_type,
+                    'wbs_code': wbs_code,
+                    'actual_cost': actual_cost,
+                    'remaining_cost': remaining_cost,
+                    'baseline_cost': baseline_cost,
                 })
             except Exception:
                 continue
