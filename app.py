@@ -12,6 +12,7 @@ Exposes:
 
 import os
 import re
+import json
 import sqlite3
 import traceback
 from datetime import datetime, timedelta
@@ -23,8 +24,10 @@ import mpxj
 jpype.startJVM()
 
 from org.mpxj.reader import UniversalProjectReader
+from net.sf.mpxj.mspdi import MSPDIWriter
+from java.time import LocalDateTime
 
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 app = Flask(__name__)
@@ -599,7 +602,12 @@ def _extract_calendar_exceptions(project):
                     # A non-working exception (e.g. a bank holiday) overrides
                     # an otherwise-working weekday. Working exceptions
                     # (e.g. a weekend made working) are skipped.
-                    if working is False:
+                    # A non-working exception (e.g. a bank holiday) overrides
+                    # an otherwise-working weekday. Working exceptions
+                    # (e.g. a weekend made working) are skipped. `isWorking`
+                    # may return a Java Boolean object rather than the Python
+                    # bool singleton, so compare by truthiness explicitly.
+                    if working is False or working == False:
                         exceptions.add(str(d.toString()))
                     d = d.plusDays(1)
             except Exception:
@@ -665,9 +673,17 @@ def _extract_progress_periods(tmp_path):
             rows = conn.execute('SELECT * FROM progress_period').fetchall()
         except Exception:
             rows = []
+        seen_ids = set()
         for i, r in enumerate(rows):
             d = dict(r)
             rid = d.get('ID')
+            # The progress_period table can repeat the same period row
+            # multiple times (one per view/summary that references it). Dedupe
+            # by ID so the dropdown shows each named period exactly once.
+            rid_str = str(rid) if rid is not None else str(i + 1)
+            if rid_str in seen_ids:
+                continue
+            seen_ids.add(rid_str)
             date_str = _parse_ast_date(d.get('REPORT_DATE'))
             name = (
                 d.get('NAME')
@@ -678,7 +694,7 @@ def _extract_progress_periods(tmp_path):
                 or f'Period {i + 1}'
             )
             periods.append({
-                'id': str(rid) if rid is not None else str(i + 1),
+                'id': rid_str,
                 'name': str(name),
                 'date': date_str,
             })
@@ -929,6 +945,103 @@ def parse():
                 os.remove(tmp_path)
             except Exception:
                 pass
+
+
+@app.route('/export', methods=['POST'])
+def export():
+    """Export a programme to MS Project XML (MSPDI), applying activity overrides
+    from the app (dates / % complete / actuals) so the exported file reflects
+    in-app changes. Reads any format UniversalProjectReader understands (Asta .pp,
+    MS Project XML, P6 ...) and writes MSPDI, which Powerproject can re-import.
+    Native Asta .pp cannot be written (proprietary) — MSPDI is the round-trip path.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    uploaded_file = request.files['file']
+    try:
+        overrides = json.loads(request.form.get('overrides', '[]'))
+    except Exception:
+        return jsonify({'error': 'Invalid overrides JSON'}), 400
+
+    tmp_path = f'/tmp/{uploaded_file.filename}'
+    base = os.path.splitext(uploaded_file.filename)[0] or 'programme'
+    out_path = f'/tmp/{base}_export.xml'
+
+    try:
+        uploaded_file.save(tmp_path)
+        project = UniversalProjectReader().read(tmp_path)
+
+        override_by_aid = {}
+        override_by_uid = {}
+        for o in overrides:
+            aid = str(o.get('asta_id') or '').strip()
+            uid = str(o.get('mpxj_unique_id') or '').strip()
+            if aid:
+                override_by_aid[aid] = o
+            if uid:
+                override_by_uid[uid] = o
+
+        def _parse_ldt(s):
+            if not s:
+                return None
+            try:
+                s = str(s).strip()
+                if len(s) == 10:
+                    return LocalDateTime.parse(s + 'T08:00:00')
+                return LocalDateTime.parse(s[:19])
+            except Exception:
+                return None
+
+        for task in project.getTasks():
+            try:
+                if _is_summary_task(task):
+                    continue
+                aid = _get_asta_utid(task)
+                uid = _safe_str(task.getUniqueID())
+                o = override_by_aid.get(aid) or override_by_uid.get(uid)
+                if not o:
+                    continue
+                start = _parse_ldt(o.get('start') or o.get('start_datetime'))
+                finish = _parse_ldt(o.get('finish') or o.get('end_datetime'))
+                if start is not None:
+                    task.setStart(start)
+                if finish is not None:
+                    task.setFinish(finish)
+                elif start is not None:
+                    task.setFinish(start)
+                pct = o.get('percent')
+                if pct is not None:
+                    try:
+                        task.setPercentageComplete(float(pct))
+                    except Exception:
+                        pass
+                status = str(o.get('status') or '').lower()
+                a_start = _parse_ldt(o.get('actual_start')) or (start if status in ('in_progress', 'completed') else None)
+                a_finish = _parse_ldt(o.get('actual_finish')) or (finish if status == 'completed' else None)
+                if a_start is not None:
+                    try:
+                        task.setActualStart(a_start)
+                    except Exception:
+                        pass
+                if a_finish is not None:
+                    try:
+                        task.setActualFinish(a_finish)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+        MSPDIWriter().write(project, out_path)
+        return send_file(out_path, as_attachment=True, download_name=f'{base}.xml', mimetype='application/xml')
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    finally:
+        for p in (tmp_path, out_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
 
 
 @app.route('/', methods=['GET'])
