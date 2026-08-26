@@ -1231,14 +1231,14 @@ def export():
         # net.sf.mpxj namespace in case a different jar build is in use.
         if fmt == 'xer':
             XERWriter = None
-            for cls_name in ('org.mpxj.primavera.PrimaveraXERWriter', 'net.sf.mpxj.primavera.PrimaveraXERWriter'):
+            for cls_name in ('org.mpxj.primavera.PrimaveraXERFileWriter', 'org.mpxj.primavera.PrimaveraXERWriter', 'net.sf.mpxj.primavera.PrimaveraXERFileWriter', 'net.sf.mpxj.primavera.PrimaveraXERWriter'):
                 try:
                     XERWriter = jpype.JClass(cls_name)
                     break
                 except Exception:
                     continue
             if XERWriter is None:
-                raise RuntimeError('PrimaveraXERWriter class not found on the MPXJ classpath.')
+                raise RuntimeError('PrimaveraXERFileWriter class not found on the MPXJ classpath.')
             XERWriter().write(project, out_path)
             return send_file(out_path, as_attachment=True, download_name=f'{base}.xer', mimetype='application/octet-stream')
         MSPDIWriter = None
