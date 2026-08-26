@@ -1151,10 +1151,14 @@ def export():
         overrides = json.loads(request.form.get('overrides', '[]'))
     except Exception:
         return jsonify({'error': 'Invalid overrides JSON'}), 400
+    fmt = (request.form.get('format') or 'mspdi').lower()
+    if fmt not in ('mspdi', 'xer'):
+        return jsonify({'error': 'Unsupported format'}), 400
 
     tmp_path = f'/tmp/{uploaded_file.filename}'
     base = os.path.splitext(uploaded_file.filename)[0] or 'programme'
-    out_path = f'/tmp/{base}_export.xml'
+    ext = 'xer' if fmt == 'xer' else 'xml'
+    out_path = f'/tmp/{base}_export.{ext}'
 
     try:
         uploaded_file.save(tmp_path)
@@ -1222,9 +1226,21 @@ def export():
             except Exception:
                 continue
 
-        # Resolve the MSPDI writer class lazily. The bundled MPXJ jar exposes
-        # classes under org.mpxj (mirroring the reader import above); fall back to
-        # the net.sf.mpxj namespace in case a different jar build is in use.
+        # Resolve the writer class lazily. The bundled MPXJ jar exposes classes
+        # under org.mpxj (mirroring the reader import above); fall back to the
+        # net.sf.mpxj namespace in case a different jar build is in use.
+        if fmt == 'xer':
+            XERWriter = None
+            for cls_name in ('org.mpxj.primavera.PrimaveraXERWriter', 'net.sf.mpxj.primavera.PrimaveraXERWriter'):
+                try:
+                    XERWriter = jpype.JClass(cls_name)
+                    break
+                except Exception:
+                    continue
+            if XERWriter is None:
+                raise RuntimeError('PrimaveraXERWriter class not found on the MPXJ classpath.')
+            XERWriter().write(project, out_path)
+            return send_file(out_path, as_attachment=True, download_name=f'{base}.xer', mimetype='application/octet-stream')
         MSPDIWriter = None
         for cls_name in ('org.mpxj.mspdi.MSPDIWriter', 'net.sf.mpxj.mspdi.MSPDIWriter'):
             try:
