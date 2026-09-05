@@ -43,6 +43,24 @@ LINK_TYPE_MAP = {
     'START_FINISH': 'SF',
 }
 
+
+def _map_link_type(rel_type):
+    """Map an MPXJ RelationType to FS/SS/FF/SF, tolerating the different
+    toString() spellings across MPXJ builds and readers ('FINISH_START',
+    'Finish to Start', 'FS', ...). Falls back to FS."""
+    raw = str(rel_type or '').upper()
+    for ch in (' ', '_', 'TO'):
+        raw = raw.replace(ch, '')
+    if 'STARTSTART' in raw:
+        return 'SS'
+    if 'FINISHFINISH' in raw:
+        return 'FF'
+    if 'STARTFINISH' in raw:
+        return 'SF'
+    if 'FINISHSTART' in raw:
+        return 'FS'
+    return LINK_TYPE_MAP.get(str(rel_type or '').strip().upper(), 'FS')
+
 # ── Constraint type mapping ──────────────────────────────────────────────────
 def _get_asta_utid(task):
     """Return the Asta Powerproject Unique Task ID (UTID).
@@ -212,12 +230,7 @@ def _get_predecessors(task):
             pred_uid = _get_asta_utid(pred_task)
             pred_id = str(pred_task.getID())
 
-            link_type_raw = str(pred.getType())
-            link_type = 'FS'
-            for key, val in LINK_TYPE_MAP.items():
-                if key in link_type_raw.upper():
-                    link_type = val
-                    break
+            link_type = _map_link_type(pred.getType())
 
             lag_days = 0
             try:
@@ -607,12 +620,7 @@ def _get_successors(task):
                 continue
             succ_uid = _get_asta_utid(succ_task)
             succ_id = str(succ_task.getID())
-            link_type_raw = str(succ.getType())
-            link_type = 'FS'
-            for key, val in LINK_TYPE_MAP.items():
-                if key in link_type_raw.upper():
-                    link_type = val
-                    break
+            link_type = _map_link_type(succ.getType())
             lag_days = 0
             try:
                 lag = succ.getLag()
