@@ -128,7 +128,56 @@ def correct_asta_links(activities, tmp_path):
         best = {}
         for k, rows in rows_by_pair.items():
             best[k] = sorted(rows, key=lambda r: (r[2], -r[3], r[4]))[0]
-        return best
+
+        # Constraints: MPXJ's Asta reader does not expose Powerproject
+        # constraints. Read them straight from the source tables and resolve
+        # to leaf UTIDs. Flag meanings verified against the XER Toolkit
+        # reference output for this programme: 1='Start On',
+        # 3='Must Start on or After'; other values are best-effort.
+        flag_type = {
+            1: 'Start On', 2: 'Start On or Before', 3: 'Must Start on or After',
+            4: 'Finish On', 5: 'Finish On or Before', 6: 'Must Finish on or After',
+            7: 'As Late As Possible', 8: 'As Early As Possible',
+        }
+        con = {}
+        for tbl in ('TASK', 'MILESTONE'):
+            try:
+                rows = conn.execute(
+                    f'SELECT ID, UNIQUE_TASK_ID, CONSTRAINT_FLAG, START_CONSTRAINT_DATE, END_CONSTRAINT_DATE '
+                    f'FROM {tbl} WHERE PROJID=? '
+                    f'AND CONSTRAINT_FLAG IS NOT NULL AND CONSTRAINT_FLAG != 0',
+                    (p,)).fetchall()
+            except Exception:
+                continue
+            for rid, utid, flag, sd, ed in rows:
+                try:
+                    t = flag_type.get(int(flag))
+                except Exception:
+                    t = None
+                if not t:
+                    continue
+                u = str(utid or '').strip() or str(rid)
+                con[u] = (t, str(sd or ed or '')[:10])
+
+        # Tasks pinned beyond their logic: Asta allows tasks to be freely
+        # positioned, but a P6/XER export can only reproduce that as a
+        # 'Must Start on or After' constraint — the XER Toolkit reference
+        # output contains exactly these synthetic constraints for tasks
+        # whose scheduled start sits after their link-driven start.
+        for tbl in ('TASK', 'MILESTONE'):
+            try:
+                rows = conn.execute(
+                    f'SELECT ID, UNIQUE_TASK_ID, EARLY_START_DATE, LINKABLE_START '
+                    f'FROM {tbl} WHERE PROJID=? AND CONSTRAINT_FLAG = 0 '
+                    f'AND EARLY_START_DATE IS NOT NULL AND LINKABLE_START IS NOT NULL '
+                    f'AND EARLY_START_DATE > LINKABLE_START', (p,)).fetchall()
+            except Exception:
+                continue
+            for rid, utid, es, ls in rows:
+                u = str(utid or '').strip() or str(rid)
+                if u not in con:
+                    con[u] = ('Must Start on or After', str(es or '')[:10])
+        return best, con
 
     def _hits(pair_map):
         n = 0
@@ -140,12 +189,12 @@ def correct_asta_links(activities, tmp_path):
                     n += 1
         return n
 
-    chosen, chosen_hits = None, 0
+    chosen, chosen_hits, chosen_con = None, 0, {}
     for p in projids:
-        m = _build_pair_map(p)
+        m, con_map = _build_pair_map(p)
         h = _hits(m)
         if h > chosen_hits:
-            chosen, chosen_hits = m, h
+            chosen, chosen_hits, chosen_con = m, h, con_map
     try:
         conn.close()
     except Exception:
@@ -169,3 +218,7 @@ def correct_asta_links(activities, tmp_path):
         if preds:
             a['link_type'] = preds[0].get('link_type', a.get('link_type'))
             a['lag_days'] = preds[0].get('lag_days', a.get('lag_days'))
+        c = chosen_con.get(au)
+        if c:
+            a['constraint_type'] = c[0]
+            a['constraint_date'] = c[1]
