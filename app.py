@@ -31,6 +31,8 @@ from org.mpxj.reader import UniversalProjectReader
 from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
+from asta_links import correct_asta_links
+
 app = Flask(__name__)
 CORS(app)
 
@@ -1108,6 +1110,10 @@ def parse():
                 })
             except Exception:
                 continue
+
+        # Correct Asta link types (MPXJ reports all FS) and lags (stored in
+        # hours) directly from the .pp database before returning.
+        correct_asta_links(activities, tmp_path)
 
         baselines = _extract_baselines(project)
 
