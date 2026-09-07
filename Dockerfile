@@ -3,6 +3,6 @@ RUN apt-get update && apt-get install -y python3 python3-pip && rm -rf /var/lib/
 WORKDIR /app
 COPY requirements.txt .
 RUN pip3 install --no-cache-dir -r requirements.txt
-COPY app.py .
+COPY app.py asta_links.py .
 EXPOSE 8000
 CMD ["python3", "app.py"]
