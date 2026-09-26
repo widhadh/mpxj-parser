@@ -32,6 +32,7 @@ from flask import Flask, request, jsonify, send_file
 from flask_cors import CORS
 
 from asta_links import correct_asta_links
+from asta_calendars import extract_calendar_exceptions
 
 app = Flask(__name__)
 CORS(app)
@@ -200,6 +201,15 @@ def _get_duration_days(task):
         return span
     days = _mpxj_duration_to_days(task.getDuration())
     return days if days else 1
+
+
+def _get_original_duration_days(task):
+    """The task's ORIGINAL (planned) duration in working days, as stored by
+    the source schedule (Asta DURATION column — the value a P6/XER export's
+    orig_drtn carries). NOT the calendar date span: split/interrupted tasks
+    can span more calendar days than their planned duration. The integrity
+    engine's duration and lag-ratio checks score this value."""
+    return _mpxj_duration_to_days(task.getDuration()) or 0
 
 
 def _get_actual_duration_days(task, duration_days):
@@ -648,15 +658,29 @@ def _get_successors(task):
 
 
 def _get_total_float_days(task):
-    """Total float / total slack in whole days — how long the task can slip
-    without delaying the project. A task with zero total float is critical.
-    MPXJ Task.getTotalSlack() returns a Duration."""
+    """Total float / total slack in HOURS — the value a P6 XER's
+    total_float_hr_cnt carries and the basis the Schedule Integrity engine
+    scores (it divides by 8 to recover working days, preserving sub-day
+    precision such as 160.016 h = 20.002 days). Returns 0 when MPXJ exposes
+    no slack."""
     try:
         dur = task.getTotalSlack()
         if dur is None:
             return 0
-        d = _mpxj_duration_to_days(dur)
-        return d if d else 0
+        val = dur.getDuration()
+        if not val:
+            return 0
+        try:
+            units = str(dur.getUnits().toString()).upper()
+        except Exception:
+            units = ''
+        if 'MINUTE' in units:
+            return round(val / 60, 4)
+        if 'HOUR' in units:
+            return round(val, 4)
+        if 'ELAPSED' in units:
+            return round(val * 24, 4)
+        return round(val * 8, 4)  # day-based units → hours
     except Exception:
         return 0
 
@@ -1005,6 +1029,7 @@ def parse():
 
                 # ── Durations (all derived in calendar days, never hours) ──
                 duration_days = _get_duration_days(task)
+                original_duration_days = _get_original_duration_days(task)
                 actual_duration_days = _get_actual_duration_days(task, duration_days)
                 remaining_duration_days = _get_remaining_duration_days(duration_days, actual_duration_days)
 
@@ -1073,6 +1098,7 @@ def parse():
                     'baseline_start_datetime': _to_iso_exact(baseline_start),
                     'baseline_finish_datetime': _to_iso_exact(baseline_finish),
                     'duration_days': duration_days,
+                    'original_duration_days': original_duration_days,
                     'duration_type': duration_type,
                     'actual_duration_days': actual_duration_days,
                     'remaining_duration_days': remaining_duration_days,
@@ -1112,8 +1138,14 @@ def parse():
                 continue
 
         # Correct Asta link types (MPXJ reports all FS) and lags (stored in
-        # hours) directly from the .pp database before returning.
-        correct_asta_links(activities, tmp_path)
+        # hours) directly from the .pp database before returning. The
+        # project status date drives injected-hammock progress status.
+        try:
+            _sd = project.getStatusDate()
+            status_date = _to_date_str(_sd) if _sd else None
+        except Exception:
+            status_date = None
+        correct_asta_links(activities, tmp_path, status_date)
 
         baselines = _extract_baselines(project)
 
@@ -1124,6 +1156,12 @@ def parse():
 
         working_days = _extract_working_days(project)
         calendar_exceptions = _extract_calendar_exceptions(project)
+        # Asta .pp: MPXJ does not expose calendar exceptions (bank holidays,
+        # Christmas shutdowns ...) — read them straight from the source
+        # database instead. Non-Asta files keep the MPXJ extraction above.
+        asta_exceptions = extract_calendar_exceptions(tmp_path, activities)
+        if asta_exceptions:
+            calendar_exceptions = asta_exceptions
         progress_periods, current_progress_period_id = _extract_progress_periods(tmp_path)
 
         return jsonify({
