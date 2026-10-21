@@ -616,6 +616,64 @@ def _get_activity_codes(task):
     return codes
 
 
+def _mpxj_color_to_hex(color):
+    """Best-effort hex colour ('#rrggbb') from an MPXJ Color object, or '' when
+    None / unavailable. MPXJ's Color exposes getRed/getGreen/getBlue (0-255)."""
+    if color is None:
+        return ''
+    try:
+        r = int(color.getRed())
+        g = int(color.getGreen())
+        b = int(color.getBlue())
+        if r == 0 and g == 0 and b == 0:
+            return ''
+        return '#{:02x}{:02x}{:02x}'.format(r, g, b)
+    except Exception:
+        return ''
+
+
+def _extract_code_libraries(project):
+    """Return the project's code libraries (Asta Powerproject code libraries)
+    as a list of { name, values: [...], value_colors: { value: '#rrggbb' } }.
+
+    MPXJ maps Powerproject code libraries to its ActivityCode model. Each
+    ActivityCode is a library; each ActivityCodeValue is one entry in that
+    library, optionally carrying a colour. Returns [] when the schedule
+    defines no code libraries or the MPXJ build does not expose the method.
+    """
+    libs = []
+    try:
+        activity_codes = list(project.getActivityCodes())
+    except Exception:
+        return libs
+    for ac in activity_codes:
+        try:
+            name = str(ac.getName() or '').strip()
+            if not name:
+                continue
+            values = []
+            value_colors = {}
+            try:
+                ac_values = list(ac.getValues())
+            except Exception:
+                ac_values = []
+            for v in ac_values:
+                try:
+                    vname = str(v.getName() or '').strip()
+                except Exception:
+                    vname = ''
+                if not vname:
+                    continue
+                values.append(vname)
+                hex_color = _mpxj_color_to_hex(v.getColor() if hasattr(v, 'getColor') else None)
+                if hex_color:
+                    value_colors[vname] = hex_color
+            libs.append({'name': name, 'values': values, 'value_colors': value_colors})
+        except Exception:
+            continue
+    return libs
+
+
 def _get_successors(task):
     """Extract ALL successor (dependent) links — the mirror of
     _get_predecessors. MPXJ Task.getSuccessors() returns the relations where
@@ -1163,6 +1221,7 @@ def parse():
         if asta_exceptions:
             calendar_exceptions = asta_exceptions
         progress_periods, current_progress_period_id = _extract_progress_periods(tmp_path)
+        code_libraries = _extract_code_libraries(project)
 
         return jsonify({
             'activities': activities,
@@ -1173,6 +1232,7 @@ def parse():
             'calendar_exceptions': calendar_exceptions,
             'progress_periods': progress_periods,
             'current_progress_period_id': current_progress_period_id,
+            'code_libraries': code_libraries,
         })
 
     except Exception as e:
