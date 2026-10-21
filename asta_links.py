@@ -1,568 +1,1385 @@
-"""Asta Powerproject link correction.
+"""
+MPXJ Microservice — parses native Asta Powerproject (.pp) files using the
+open-source MPXJ Java library via JPype, returns structured JSON.
 
-MPXJ's Asta reader reports every relation as FINISH_START and returns lag
-values in hours. The .pp SQLite database stores each link's true kind in the
-LINK table (LINK_KIND: 0=FS, 1=SS, 2=FF, 3=SF) and its lag as an AstaDuration
-whose value is in hours. This module reads the LINK table directly and
-rewrites each activity's predecessor/successor link lists from the source
-table (true kinds, lags converted hours -> days) and injects the LOE/hammock
-tasks MPXJ does not surface. Non-Asta files are left unchanged (the queries
-simply fail).
+Deploy to Render / any Python host:
+  pip install -r requirements.txt
+  gunicorn -w 2 -b 0.0.0.0:5000 --timeout 120 app:app
+
+Exposes:
+  POST /parse  (multipart/form-data, field: file)  →  JSON { activities, baselines }
 """
 
+import os
+import re
+import json
 import sqlite3
-from datetime import date
+import traceback
+from datetime import datetime, timedelta
+
+import jpype
+import mpxj
+
+# Start the JVM once at module import — each gunicorn worker runs this independently
+jpype.startJVM()
+
+from org.mpxj.reader import UniversalProjectReader
+
+# MSPDIWriter + LocalDateTime are resolved lazily inside /export via jpype.JClass
+# so a missing writer class never breaks service startup (and never breaks /parse).
+
+from flask import Flask, request, jsonify, send_file
+from flask_cors import CORS
+
+from asta_links import correct_asta_links
+from asta_calendars import extract_calendar_exceptions
+
+app = Flask(__name__)
+CORS(app)
 
 
-def correct_asta_links(activities, tmp_path, status_date=None):
+# ── Link type mapping ─────────────────────────────────────────────────────────
+LINK_TYPE_MAP = {
+    'FINISH_START': 'FS',
+    'START_START': 'SS',
+    'FINISH_FINISH': 'FF',
+    'START_FINISH': 'SF',
+}
+
+
+def _map_link_type(rel_type):
+    """Map an MPXJ RelationType to FS/SS/FF/SF, tolerating the different
+    toString() spellings across MPXJ builds and readers ('FINISH_START',
+    'Finish to Start', 'FS', ...). Falls back to FS."""
+    raw = str(rel_type or '').upper()
+    for ch in (' ', '_', 'TO'):
+        raw = raw.replace(ch, '')
+    if 'STARTSTART' in raw:
+        return 'SS'
+    if 'FINISHFINISH' in raw:
+        return 'FF'
+    if 'STARTFINISH' in raw:
+        return 'SF'
+    if 'FINISHSTART' in raw:
+        return 'FS'
+    return LINK_TYPE_MAP.get(str(rel_type or '').strip().upper(), 'FS')
+
+# ── Constraint type mapping ──────────────────────────────────────────────────
+def _get_asta_utid(task):
+    """Return the Asta Powerproject Unique Task ID (UTID).
+
+    MPXJ exposes this via getActivityID() — which for Powerproject files is
+    populated from the programme's "Unique Task ID" attribute (the alphanumeric
+    identifier shown in Asta's ID column). getUniqueID() returns MPXJ's own
+    internal integer ID, NOT the Asta UTID.
+
+    Falls back to getUniqueID() if the file doesn't populate Activity ID
+    (e.g. MS Project / Primavera files).
+    """
     try:
-        conn = sqlite3.connect(tmp_path)
-        projids = [r[0] for r in conn.execute('SELECT DISTINCT PROJID FROM LINK')]
+        aid = task.getActivityID()
+        if aid is not None:
+            s = str(aid).strip()
+            if s:
+                return s
     except Exception:
-        return
+        pass
+    try:
+        return str(task.getUniqueID())
+    except Exception:
+        return ''
 
-    def _utid_map(table, p):
-        m = {}
-        try:
-            for rid, utid in conn.execute(
-                    f'SELECT ID, UNIQUE_TASK_ID FROM {table} WHERE PROJID=?', (p,)):
-                m[rid] = str(utid or '').strip() or str(rid)
-        except Exception:
-            pass
-        return m
 
-    def _lag_days(raw):
-        # AstaDuration blob '<unit, ?, value>' — the value is stored in hours
-        try:
-            parts = [x for x in str(raw or '').replace('<', '').replace('>', '').split(',') if x != '']
-            v = float(parts[2]) if len(parts) >= 3 else 0.0
-        except Exception:
-            return 0
-        d = v / 8.0
-        return int(d) if d == int(d) else round(d, 2)
+def _constraint_type(task):
+    try:
+        c = task.getConstraint()
+        if c is not None:
+            return str(c.toString())
+    except Exception:
+        pass
+    return ''
 
-    def _build_pair_map(p):
-        task = _utid_map('TASK', p)
-        ms = _utid_map('MILESTONE', p)
-        exp_utid, exp_bar = {}, {}
+
+def _safe_str(val):
+    if val is None:
+        return ''
+    return str(val)
+
+
+def _to_date_str(dt):
+    """Convert a Java LocalDateTime / Date to YYYY-MM-DD, or '' if None.
+
+    NOTE: This truncates the time-of-day. Use _to_iso_exact when the frontend
+    Gantt needs to know exactly when a task starts/stops (e.g. a half-day
+    finishing at 12:00)."""
+    if dt is None:
+        return ''
+    try:
+        return str(dt.toLocalDate().toString())
+    except Exception:
+        pass
+    try:
+        s = str(dt.toString())
+        if len(s) >= 10 and s[4] == '-' and s[7] == '-':
+            return s[:10]
+    except Exception:
+        pass
+    return ''
+
+
+def _to_iso_exact(dt):
+    """Convert a Java LocalDateTime / Date to a FULL ISO timestamp
+    (YYYY-MM-DDTHH:MM:SS), preserving the time-of-day.
+
+    This is the absolute source of truth for task start/stop times — the
+    frontend Gantt uses the time portion to position bar edges with sub-day
+    precision (so a task finishing at 12:00 on Friday renders as a half-day,
+    not a full day). Returns '' if None."""
+    if dt is None:
+        return ''
+    try:
+        date_part = str(dt.toLocalDate().toString())
+        time_part = str(dt.toLocalTime().toString())
+        # Truncate sub-second precision; HH:MM:SS is enough for the Gantt
+        if '.' in time_part:
+            time_part = time_part.split('.')[0]
+        if len(time_part) == 5:  # HH:MM → HH:MM:00
+            time_part = time_part + ':00'
+        return f'{date_part}T{time_part}'
+    except Exception:
+        pass
+    try:
+        s = str(dt.toString()).replace(' ', 'T')
+        if 'T' in s and len(s) >= 19:
+            return s[:19]
+    except Exception:
+        pass
+    return _to_date_str(dt)
+
+
+def _date_span_days(task):
+    """Return the inclusive calendar-day span from start to finish, or None."""
+    try:
+        start = task.getStart()
+        finish = task.getFinish()
+        if start is not None and finish is not None:
+            delta = (finish.toLocalDate().toEpochDay() - start.toLocalDate().toEpochDay()) + 1
+            if delta > 0:
+                return int(delta)
+    except Exception:
+        pass
+    return None
+
+
+def _mpxj_duration_to_days(dur):
+    """Convert an MPXJ Duration object to whole days, handling hours."""
+    if dur is None:
+        return None
+    try:
+        val = dur.getDuration()
+        if not val or val <= 0:
+            return None
         try:
-            for rid, utid, bar in conn.execute(
-                    'SELECT ID, UNIQUE_TASK_ID, BAR FROM EXPANDED_TASK WHERE PROJID=?', (p,)):
-                exp_utid[rid] = str(utid or '').strip() or str(rid)
-                exp_bar[rid] = bar
+            units = str(dur.getUnits().toString()).upper()
         except Exception:
-            pass
-        leaves_by_exp, leaves_by_bar = {}, {}
-        for tbl in ('TASK', 'MILESTONE'):
+            units = ''
+        if 'HOUR' in units:
+            return max(1, round(val / 8))
+        if 'MINUTE' in units:
+            return max(1, round(val / 60 / 8))
+        return max(1, int(val))
+    except Exception:
+        return None
+
+
+def _get_duration_days(task):
+    """Duration in calendar days, derived from the start→finish date span
+    (which matches what the Gantt displays). Falls back to the MPXJ duration
+    value (converting hours→days) only when no dates are available."""
+    span = _date_span_days(task)
+    if span:
+        return span
+    days = _mpxj_duration_to_days(task.getDuration())
+    return days if days else 1
+
+
+def _get_original_duration_days(task):
+    """The task's ORIGINAL (planned) duration in working days, as stored by
+    the source schedule (Asta DURATION column — the value a P6/XER export's
+    orig_drtn carries). NOT the calendar date span: split/interrupted tasks
+    can span more calendar days than their planned duration. The integrity
+    engine's duration and lag-ratio checks score this value."""
+    return _mpxj_duration_to_days(task.getDuration()) or 0
+
+
+def _get_actual_duration_days(task, duration_days):
+    """Actual worked days, derived from percentage complete so it's always
+    consistent with duration_days (never in hours)."""
+    pct = _get_percentage_complete(task)
+    if pct >= 100:
+        return duration_days
+    if pct > 0:
+        return round(duration_days * pct / 100)
+    return 0
+
+
+def _get_remaining_duration_days(duration_days, actual_duration_days):
+    return max(0, duration_days - actual_duration_days)
+
+
+def _get_predecessors(task):
+    """Extract ALL predecessor links, not just the first."""
+    links = []
+    try:
+        preds = task.getPredecessors()
+        if not preds:
+            return links
+        for pred in preds:
+            pred_task = pred.getPredecessorTask()
+            if pred_task is None:
+                continue
+            # Use the Asta UTID (getActivityID) for linking, with getUniqueID as fallback
+            pred_uid = _get_asta_utid(pred_task)
+            pred_id = str(pred_task.getID())
+
+            link_type = _map_link_type(pred.getType())
+
+            lag_days = 0
             try:
-                for rid, utid, sub, bar in conn.execute(
-                        f'SELECT ID, UNIQUE_TASK_ID, SUBPROJECT_ID, BAR FROM {tbl} WHERE PROJID=?', (p,)):
-                    u = str(utid or '').strip() or str(rid)
-                    if sub is not None:
-                        leaves_by_exp.setdefault(sub, []).append(u)
-                    elif bar is not None:
-                        leaves_by_bar.setdefault(bar, []).append(u)
+                lag = pred.getLag()
+                if lag is not None:
+                    lag_val = lag.getDuration()
+                    lag_units = str(lag.getUnits().toString()).upper() if hasattr(lag, 'getUnits') else ''
+                    if lag_val:
+                        if 'HOUR' in lag_units:
+                            lag_days = round(lag_val / 8)
+                        else:
+                            lag_days = int(lag_val)
             except Exception:
                 pass
-        bar_ids = set()
+
+            links.append({
+                'pred_unique_id': pred_uid,
+                'pred_id': pred_id,
+                'link_type': link_type,
+                'lag_days': lag_days,
+            })
+    except Exception:
+        pass
+    return links
+
+
+def _is_summary_task(task):
+    try:
+        val = task.getSummary()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
+
+
+def _is_milestone(task):
+    try:
+        val = task.getMilestone()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
+
+
+def _is_critical(task):
+    try:
+        val = task.getCritical()
+        if val is not None:
+            return bool(val)
+    except Exception:
+        pass
+    return False
+
+
+def _get_outline_level(task):
+    try:
+        level = task.getOutlineLevel()
+        if level is not None:
+            return str(level)
+    except Exception:
+        pass
+    return ''
+
+
+def _get_parent_uid(task):
+    """Return the parent's Asta UTID so it matches the child's asta_id."""
+    try:
+        parent = task.getParentTask()
+        if parent is not None:
+            return _get_asta_utid(parent)
+    except Exception:
+        pass
+    return ''
+
+
+def _get_percentage_complete(task):
+    try:
+        pct = task.getPercentageComplete()
+        if pct is not None:
+            return float(pct)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_priority(task):
+    try:
+        p = task.getPriority()
+        if p is not None:
+            return str(p.toString())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_cost(task):
+    try:
+        cost = task.getCost()
+        if cost is not None:
+            return float(cost)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_calendar_name(task):
+    try:
+        cal = task.getCalendar()
+        if cal is not None:
+            return str(cal.getName())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_calendar_details(task):
+    """Return the working rules of the calendar ASSIGNED to this task.
+
+    Asta allows each task to have its own calendar (e.g. a "Concrete Cure"
+    task may run 24/7 while "Site Works" runs Monday–Friday). Returns:
+        working_days : list[int]  — day-of-week numbers that are working (0=Sun..6=Sat), or [] if unknown
+        is_24_7      : bool       — True if every day of the week is working (an elapsed/24-7 calendar)
+    """
+    try:
+        cal = task.getCalendar()
+        if cal is None:
+            return [], False
+        working = []
         try:
-            bar_ids = {r[0] for r in conn.execute('SELECT ID FROM BAR WHERE PROJID=?', (p,))}
+            wd = cal.getWorkingDays()
+            if wd is not None and len(wd) == 7:
+                for i, d in enumerate(wd):
+                    s = str(d.toString()).upper()
+                    if 'WORKING' in s and 'NON' not in s:
+                        working.append(i)
         except Exception:
             pass
-        exps_by_bar = {}
-        for rid, bar in exp_bar.items():
-            if bar is not None:
-                exps_by_bar.setdefault(bar, []).append((rid, exp_utid[rid]))
-        tc = {}
+        return working, len(working) == 7
+    except Exception:
+        return [], False
+
+
+def _get_duration_type(task):
+    """Determine whether this task's duration is 'elapsed' or 'working'.
+
+    MPXJ encodes elapsed durations (which ignore calendars — e.g. concrete
+    curing that runs 24/7) with an ELAPSED_* unit. Working durations obey
+    the assigned calendar. The frontend uses this to decide whether a
+    duration counts calendar time or working time.
+    """
+    try:
+        dur = task.getDuration()
+        if dur is not None:
+            units = str(dur.getUnits().toString()).upper()
+            if 'ELAPSED' in units:
+                return 'elapsed'
+    except Exception:
+        pass
+    return 'working'
+
+
+def _extract_working_days(project):
+    """Read the working day-of-week pattern (0=Sun..6=Sat) from the
+    programme's default calendar. Falls back to Mon–Fri."""
+    default = [1, 2, 3, 4, 5]
+    try:
+        cals = list(project.getCalendars())
+    except Exception:
+        return default
+    if not cals:
+        return default
+
+    default_cal = None
+    for c in cals:
         try:
-            for rid, tsk in conn.execute(
-                    'SELECT ID, TASK FROM task_completed_section WHERE PROJID=?', (p,)):
-                tc[rid] = tsk
+            if c.isDefault():
+                default_cal = c
+                break
         except Exception:
             pass
+    if default_cal is None:
+        default_cal = cals[0]
 
-        def resolve(x, depth=0):
-            if depth > 6:
-                return []
-            if x in task:
-                return [task[x]]
-            if x in ms:
-                return [ms[x]]
-            if x in bar_ids:
-                out = []
-                for eid, eutid in exps_by_bar.get(x, []):
-                    out.append(eutid)
-                    out.extend(leaves_by_exp.get(eid, []))
-                out.extend(leaves_by_bar.get(x, []))
-                seen, uniq = set(), []
-                for u in out:
-                    if u not in seen:
-                        seen.add(u)
-                        uniq.append(u)
-                return uniq
-            if x in exp_utid:
-                return [exp_utid[x]]
-            if x in tc:
-                return resolve(tc[x], depth + 1)
-            return []
+    # getWorkingDays() → 7-element array indexed Sunday(0)..Saturday(6),
+    # each element one of Day.WORKING / Day.NON_WORKING / Day.PARENT.
+    try:
+        wd = default_cal.getWorkingDays()
+        if wd and len(wd) == 7:
+            working = []
+            for i, d in enumerate(wd):
+                s = str(d.toString()).upper()
+                if 'WORKING' in s and 'NON' not in s:
+                    working.append(i)
+            if working:
+                return working
+    except Exception:
+        pass
 
-        kind_map = {0: 'FS', 1: 'SS', 2: 'FF', 3: 'SF'}
-        try:
-            link_rows = conn.execute(
-                'SELECT START_TASK, END_TASK, LINK_KIND, START_LAG_TIME, END_LAG_TIME, DRIVING, ID '
-                'FROM LINK WHERE PROJID=? ORDER BY ID', (p,)).fetchall()
-        except Exception:
-            return {}
-        rows_by_pair = {}
-        for st, en, kind, slag, elag, drv, rid in link_rows:
-            preds = resolve(st)
-            succs = resolve(en)
-            if not preds or not succs:
-                continue
+    return default
+
+
+def _get_notes(task):
+    try:
+        notes = task.getNotes()
+        if notes is not None:
+            return str(notes)
+    except Exception:
+        pass
+    return ''
+
+
+def _map_resource_type(res):
+    """Map MPXJ ResourceType → (resource_type, category).
+
+    Returns a tuple:
+        resource_type : 'permanent' | 'temporary'
+            permanent  = labour/plant (allocated for a duration)
+            temporary  = material/cost (consumed in quantity)
+        category : 'people' | 'plant'
+            people = labour / work resources
+            plant  = equipment / machinery resources
+
+    MPXJ ResourceType values:
+        WORK        → permanent / people
+        LABOR/LABOUR→ permanent / people
+        EQUIPMENT   → permanent / plant
+        MATERIAL    → temporary / plant   (consumable material)
+        COST        → temporary / plant   (cost-type, treat as consumable)
+    """
+    try:
+        rt = res.getType()
+        if rt is not None:
+            s = str(rt.toString()).upper()
+            if 'MATERIAL' in s:
+                return ('temporary', 'plant')
+            if 'EQUIPMENT' in s:
+                return ('permanent', 'plant')
+            if 'LABOR' in s or 'LABOUR' in s or 'WORK' in s:
+                return ('permanent', 'people')
+            if 'COST' in s:
+                return ('temporary', 'plant')
+    except Exception:
+        pass
+    return ('permanent', 'people')
+
+
+def _get_resource_assignment_units(assign):
+    """Best-effort extraction of the quantity allocated to a task.
+
+    Returns a number (units) — the allocation for this assignment.  MPXJ stores
+    this as a percentage (e.g. 100 = 1 full resource), so we convert to whole
+    units when possible.
+    """
+    # getUnits() → allocation percentage (100 = 1.0 resource)
+    try:
+        u = assign.getUnits()
+        if u is not None:
+            val = float(u)
+            if val and val > 0:
+                # Convert percentage to whole units (100% = 1, 200% = 2)
+                if val >= 100:
+                    return round(val / 100, 2)
+                return round(val / 100, 2)
+    except Exception:
+        pass
+    # getAmount() → absolute amount for consumable resources
+    try:
+        amt = assign.getAmount()
+        if amt is not None:
+            val = float(amt)
+            if val and val > 0:
+                return round(val, 2)
+    except Exception:
+        pass
+    return 1
+
+
+def _get_resource_names(task):
+    """Extract resource assignment names (backward-compatible)."""
+    names = []
+    try:
+        assignments = task.getResourceAssignments()
+        if not assignments:
+            return names
+        for assign in assignments:
             try:
-                t = kind_map.get(int(kind), 'FS')
+                res = assign.getResource()
+                if res is not None:
+                    name = str(res.getName())
+                    if name:
+                        names.append(name)
             except Exception:
-                t = 'FS'
-            lag = _lag_days(slag) - _lag_days(elag)
-            ambig = len(preds) > 1 or len(succs) > 1
-            for pr in preds:
-                for su in succs:
-                    rows_by_pair.setdefault(f'{pr}>{su}', []).append((t, lag, ambig, 1 if drv else 0, rid))
-        # Keep EVERY LINK row per (pred, succ) pair, ordered: a .pp can define
-        # several links for the same pair (e.g. an FS with a -1-day end lag
-        # next to a plain FS) and the XER export carries all of them — the
-        # importer zips them onto the parsed link entries pair by pair.
-        best = {}
-        for k, rows in rows_by_pair.items():
-            best[k] = sorted(rows, key=lambda r: (r[2], -r[3], r[4]))
+                pass
+    except Exception:
+        pass
+    return names
 
-        # Constraints: MPXJ's Asta reader does not expose Powerproject
-        # constraints. Read them straight from the source tables and resolve
-        # to leaf UTIDs. Flag meanings verified against the XER Toolkit
-        # reference output for this programme: 1='Start On',
-        # 3='Must Start on or After'; other values are best-effort.
-        flag_type = {
-            1: 'Start On', 2: 'Start On or Before', 3: 'Must Start on or After',
-            4: 'Finish On', 5: 'Finish On or Before', 6: 'Must Finish on or After',
-            7: 'As Late As Possible', 8: 'As Early As Possible',
-        }
-        con = {}
-        for tbl in ('TASK', 'MILESTONE'):
+
+def _get_resource_assignments(task):
+    """Extract full resource assignments with type and allocated quantity.
+
+    Returns a list of dicts:
+        { name, resource_type ('permanent'|'temporary'), category ('people'|'plant'), units }
+    """
+    assignments_out = []
+    try:
+        assignments = task.getResourceAssignments()
+        if not assignments:
+            return assignments_out
+        for assign in assignments:
             try:
-                rows = conn.execute(
-                    f'SELECT ID, UNIQUE_TASK_ID, CONSTRAINT_FLAG, START_CONSTRAINT_DATE, END_CONSTRAINT_DATE '
-                    f'FROM {tbl} WHERE PROJID=? '
-                    f'AND CONSTRAINT_FLAG IS NOT NULL AND CONSTRAINT_FLAG != 0',
-                    (p,)).fetchall()
-            except Exception:
-                continue
-            for rid, utid, flag, sd, ed in rows:
-                try:
-                    t = flag_type.get(int(flag))
-                except Exception:
-                    t = None
-                if not t:
+                res = assign.getResource()
+                if res is None:
                     continue
-                u = str(utid or '').strip() or str(rid)
-                con[u] = (t, str(sd or ed or '')[:10])
+                name = str(res.getName())
+                if not name:
+                    continue
+                rtype, category = _map_resource_type(res)
+                assignments_out.append({
+                    'name': name,
+                    'resource_type': rtype,
+                    'category': category,
+                    'units': _get_resource_assignment_units(assign),
+                })
+            except Exception:
+                pass
+    except Exception:
+        pass
+    return assignments_out
 
-        # As-Late-As-Possible placement: Asta stores 'as late as possible' as
-        # PLACEMENT=1 rather than a constraint flag — a P6/XER export carries
-        # it as an explicit As-Late-As-Possible constraint. Constraint flags
-        # win when both are set (verified against the XER Toolkit reference
-        # output for this programme).
-        for tbl in ('TASK', 'MILESTONE'):
+
+def _get_activity_codes(task):
+    """Return the Asta Powerproject code-library assignments for this task as
+    a dict {library_name: code_value_name}.
+
+    MPXJ's AstaReader maps Powerproject code libraries to its ActivityCode /
+    ActivityCodeValue model. Task.getActivityCodeValues() returns a Map
+    keyed by ActivityCode (the library) whose value is the assigned
+    ActivityCodeValue (the code). A task normally carries one value per
+    library; if a library appears multiple times the values are joined
+    with ', '. Returns {} when the schedule defines no code libraries or
+    the MPXJ build does not expose the method.
+    """
+    codes = {}
+    try:
+        acv_map = task.getActivityCodeValues()
+        if not acv_map:
+            return codes
+        for entry in acv_map.entrySet():
             try:
-                rows = conn.execute(
-                    f'SELECT ID, UNIQUE_TASK_ID FROM {tbl} WHERE PROJID=? '
-                    f'AND PLACEMENT = 1', (p,)).fetchall()
+                ac = entry.getKey()
+                val = entry.getValue()
+                if ac is None or val is None:
+                    continue
+                lib = str(ac.getName() or '').strip()
+                vname = str(val.getName() or '').strip()
+                if not lib or not vname:
+                    continue
+                if lib in codes:
+                    parts = [p.strip() for p in codes[lib].split(',')]
+                    if vname not in parts:
+                        codes[lib] = codes[lib] + ', ' + vname
+                else:
+                    codes[lib] = vname
             except Exception:
                 continue
-            for rid, utid in rows:
-                u = str(utid or '').strip() or str(rid)
-                if u not in con:
-                    con[u] = ('As Late As Possible', '')
-        # Tasks pinned beyond their logic: Asta allows tasks to be freely
-        # positioned, but a P6/XER export can only reproduce that as a
-        # 'Must Start on or After' constraint — the XER Toolkit reference
-        # output contains exactly these synthetic constraints for tasks
-        # whose scheduled start sits after their link-driven start.
-        for tbl in ('TASK', 'MILESTONE'):
+    except Exception:
+        pass
+    return codes
+
+
+def _mpxj_color_to_hex(color):
+    """Best-effort hex colour ('#rrggbb') from an MPXJ Color object, or '' when
+    None / unavailable. MPXJ's Color exposes getRed/getGreen/getBlue (0-255)."""
+    if color is None:
+        return ''
+    try:
+        r = int(color.getRed())
+        g = int(color.getGreen())
+        b = int(color.getBlue())
+        if r == 0 and g == 0 and b == 0:
+            return ''
+        return '#{:02x}{:02x}{:02x}'.format(r, g, b)
+    except Exception:
+        return ''
+
+
+def _extract_code_libraries(project):
+    """Return the project's code libraries (Asta Powerproject code libraries)
+    as a list of { name, values: [...], value_colors: { value: '#rrggbb' } }.
+
+    MPXJ maps Powerproject code libraries to its ActivityCode model. Each
+    ActivityCode is a library; each ActivityCodeValue is one entry in that
+    library, optionally carrying a colour. Returns [] when the schedule
+    defines no code libraries or the MPXJ build does not expose the method.
+    """
+    libs = []
+    try:
+        activity_codes = list(project.getActivityCodes())
+    except Exception:
+        return libs
+    for ac in activity_codes:
+        try:
+            name = str(ac.getName() or '').strip()
+            if not name:
+                continue
+            values = []
+            value_colors = {}
             try:
-                rows = conn.execute(
-                    f'SELECT ID, UNIQUE_TASK_ID, EARLY_START_DATE, LINKABLE_START '
-                    f'FROM {tbl} WHERE PROJID=? AND CONSTRAINT_FLAG = 0 '
-                    f'AND EARLY_START_DATE IS NOT NULL AND LINKABLE_START IS NOT NULL '
-                    f'AND EARLY_START_DATE > LINKABLE_START', (p,)).fetchall()
+                ac_values = list(ac.getValues())
+            except Exception:
+                ac_values = []
+            for v in ac_values:
+                try:
+                    vname = str(v.getName() or '').strip()
+                except Exception:
+                    vname = ''
+                if not vname:
+                    continue
+                values.append(vname)
+                hex_color = _mpxj_color_to_hex(v.getColor() if hasattr(v, 'getColor') else None)
+                if hex_color:
+                    value_colors[vname] = hex_color
+            libs.append({'name': name, 'values': values, 'value_colors': value_colors})
+        except Exception:
+            continue
+    return libs
+
+
+def _get_successors(task):
+    """Extract ALL successor (dependent) links — the mirror of
+    _get_predecessors. MPXJ Task.getSuccessors() returns the relations where
+    this task is the predecessor; each relation's getSuccessorTask() is the
+    downstream task that depends on this one."""
+    links = []
+    try:
+        succs = task.getSuccessors()
+        if not succs:
+            return links
+        for succ in succs:
+            succ_task = succ.getSuccessorTask()
+            if succ_task is None:
+                continue
+            succ_uid = _get_asta_utid(succ_task)
+            succ_id = str(succ_task.getID())
+            link_type = _map_link_type(succ.getType())
+            lag_days = 0
+            try:
+                lag = succ.getLag()
+                if lag is not None:
+                    lag_val = lag.getDuration()
+                    lag_units = str(lag.getUnits().toString()).upper() if hasattr(lag, 'getUnits') else ''
+                    if lag_val:
+                        if 'HOUR' in lag_units:
+                            lag_days = round(lag_val / 8)
+                        else:
+                            lag_days = int(lag_val)
+            except Exception:
+                pass
+            links.append({
+                'succ_unique_id': succ_uid,
+                'succ_id': succ_id,
+                'link_type': link_type,
+                'lag_days': lag_days,
+            })
+    except Exception:
+        pass
+    return links
+
+
+def _get_total_float_days(task):
+    """Total float / total slack in HOURS — the value a P6 XER's
+    total_float_hr_cnt carries and the basis the Schedule Integrity engine
+    scores (it divides by 8 to recover working days, preserving sub-day
+    precision such as 160.016 h = 20.002 days). Returns 0 when MPXJ exposes
+    no slack."""
+    try:
+        dur = task.getTotalSlack()
+        if dur is None:
+            return 0
+        val = dur.getDuration()
+        if not val:
+            return 0
+        try:
+            units = str(dur.getUnits().toString()).upper()
+        except Exception:
+            units = ''
+        if 'MINUTE' in units:
+            return round(val / 60, 4)
+        if 'HOUR' in units:
+            return round(val, 4)
+        if 'ELAPSED' in units:
+            return round(val * 24, 4)
+        return round(val * 8, 4)  # day-based units → hours
+    except Exception:
+        return 0
+
+
+def _get_free_float_days(task):
+    """Free float / free slack in whole days — how long the task can slip
+    without delaying any successor. MPXJ Task.getFreeSlack()."""
+    try:
+        dur = task.getFreeSlack()
+        if dur is None:
+            return 0
+        d = _mpxj_duration_to_days(dur)
+        return d if d else 0
+    except Exception:
+        return 0
+
+
+def _get_task_type(task):
+    """Task type (Fixed Duration / Fixed Work / Fixed Units). Asta's
+    'duration type' maps to these MPXJ TaskType values."""
+    try:
+        t = task.getType()
+        if t is not None:
+            return str(t.toString())
+    except Exception:
+        pass
+    return ''
+
+
+def _get_wbs_code(task):
+    """WBS code path string (e.g. '1.2.3') — distinct from the outline level
+    number. MPXJ Task.getWBS()."""
+    try:
+        w = task.getWBS()
+        if w is not None:
+            return str(w)
+    except Exception:
+        pass
+    return ''
+
+
+def _get_actual_cost(task):
+    try:
+        c = task.getActualCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_remaining_cost(task):
+    try:
+        c = task.getRemainingCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _get_baseline_cost(task):
+    try:
+        c = task.getBaselineCost()
+        if c is not None:
+            return float(c)
+    except Exception:
+        pass
+    return 0.0
+
+
+def _compute_status(task, pct_complete, actual_start, actual_finish):
+    """Derive a status from MPXJ actuals + percentage complete."""
+    if pct_complete >= 100:
+        return 'completed'
+    if actual_start is not None and actual_finish is not None:
+        return 'completed'
+    if pct_complete > 0 or actual_start is not None:
+        return 'in_progress'
+    return 'pending'
+
+
+def _extract_calendar_exceptions(project):
+    """Collect non-working calendar exception dates (bank holidays) observed
+    by the uploaded programme's calendars.
+
+    Returns a sorted list of unique ISO date strings (YYYY-MM-DD). A
+    programme that does not observe bank holidays has no non-working
+    exceptions -> empty list. The frontend uses this set instead of a
+    hardcoded UK bank-holiday list so the calendar matches the upload,
+    including the use OR non-use of bank holidays.
+    """
+    exceptions = set()
+    try:
+        cals = list(project.getCalendars())
+    except Exception:
+        return []
+    for cal in cals:
+        try:
+            excs = cal.getCalendarExceptions()
+        except Exception:
+            excs = None
+        if not excs:
+            continue
+        for exc in excs:
+            try:
+                # MPXJ returns either LocalDateRange (old API) or
+                # ProjectCalendarException (new API, exposes getRange()).
+                try:
+                    rng = exc.getRange()
+                except Exception:
+                    rng = exc
+                start = rng.getStart()
+                end = rng.getEnd()
+                d = start
+                while d.compareTo(end) <= 0:
+                    try:
+                        working = cal.isWorking(d)
+                    except Exception:
+                        working = None
+                    # A non-working exception (e.g. a bank holiday) overrides
+                    # an otherwise-working weekday. Working exceptions
+                    # (e.g. a weekend made working) are skipped.
+                    # A non-working exception (e.g. a bank holiday) overrides
+                    # an otherwise-working weekday. Working exceptions
+                    # (e.g. a weekend made working) are skipped. `isWorking`
+                    # may return a Java Boolean object rather than the Python
+                    # bool singleton, so compare by truthiness explicitly.
+                    if working is False or working == False:
+                        exceptions.add(str(d.toString()))
+                    d = d.plusDays(1)
             except Exception:
                 continue
-            for rid, utid, es, ls in rows:
-                u = str(utid or '').strip() or str(rid)
-                if u not in con:
-                    con[u] = ('Must Start on or After', str(es or '')[:10])
-        return best, con
+    return sorted(exceptions)
 
-    def _hits(pair_map):
-        n = 0
-        for a in activities:
-            au = a.get('asta_id')
-            for pr in a.get('all_predecessors') or []:
-                key = f"{pr.get('pred_unique_id') or pr.get('pred_id')}>{au}"
-                if key in pair_map:
-                    n += 1
-        return n
 
-    chosen, chosen_hits, chosen_con, chosen_p = None, 0, {}, None
-    for p in projids:
-        m, con_map = _build_pair_map(p)
-        h = _hits(m)
-        if h > chosen_hits:
-            chosen, chosen_hits, chosen_con, chosen_p = m, h, con_map, p
+def _parse_ast_date(value):
+    """Parse a date value from an Asta SQLite column into YYYY-MM-DD.
 
-    # Grouping containers (Asta expanded tasks): a LEAF activity whose UTID
-    # belongs to an expanded task is an empty grouping node (no tasks of its
-    # own) — MPXJ surfaces it as a stray leaf task. A P6 XER import keeps
-    # every container as a WBS element even when it holds no activities, so
-    # keep them too — flagged as summaries so they stay out of the scored
-    # task population but still count as WBS nodes (and give their parent
-    # container a WBS group) in the integrity engine. Containers WITH
-    # members already arrive flagged as summaries. Run BEFORE the hammock
-    # injection so injected LOE tasks are never touched.
-    exp_utids = set()
-    try:
-        for (utid,) in conn.execute(
-                'SELECT UNIQUE_TASK_ID FROM EXPANDED_TASK WHERE PROJID=?', (chosen_p or 0,)):
-            u = str(utid or '').strip()
-            if u:
-                exp_utids.add(u)
-    except Exception:
-        exp_utids = set()
-    if exp_utids:
-        for a in activities:
-            if (not a.get('is_summary')
-                    and str(a.get('asta_id') or '').strip() in exp_utids):
-                a['is_summary'] = True
-
-    # LOE / hammock tasks: MPXJ does not read the HAMMOCK_TASK table, but a
-    # P6 import of the same file carries them as regular activities.
-    injected = _inject_hammocks(conn, chosen_p or 0, status_date)
-    activities.extend(injected)
-
-    # Row-id → UTID lookups (TASK/MILESTONE) used to resolve allocation and
-    # hammock-member endpoints in the sections below.
-    row_utid = {}
-    for tbl in ('TASK', 'MILESTONE'):
+    Asta .pp SQLite stores dates as strings in 'yyyy-MM-dd HH:mm:ss' format
+    (per MPXJ's SQLite date_string_format). Some columns/older files may store
+    integers (Asta epoch seconds from 1990-01-01) — handle both.
+    """
+    if value is None:
+        return ''
+    s = str(value).strip()
+    if not s:
+        return ''
+    # ISO-like string: take the date part directly
+    if re.match(r'^\d{4}-\d{2}-\d{2}', s):
+        return s[:10]
+    # Pure integer — try Asta epoch (seconds from 1990-01-01), then unix seconds/ms
+    if s.isdigit():
+        n = int(s)
+        for epoch, scale in ((datetime(1990, 1, 1), 1), (datetime(1970, 1, 1), 1), (datetime(1970, 1, 1), 0.001)):
+            try:
+                d = epoch + timedelta(seconds=n * scale)
+                if 1990 <= d.year <= 2100:
+                    return d.strftime('%Y-%m-%d')
+            except Exception:
+                pass
+    # Excel serial (5-digit)
+    if re.match(r'^\d{5,6}$', s):
         try:
-            for rid, utid in conn.execute(
-                    f'SELECT ID, UNIQUE_TASK_ID FROM {tbl} WHERE PROJID=?',
-                    (chosen_p or 0,)):
-                row_utid[rid] = str(utid or '').strip() or str(rid)
+            d = datetime(1899, 12, 30) + timedelta(days=int(s))
+            if 1990 <= d.year <= 2100:
+                return d.strftime('%Y-%m-%d')
         except Exception:
             pass
-    by_au = {str(a.get('asta_id') or '').strip(): a for a in activities}
+    return s[:10]
 
-    # ── Resource allocations ─────────────────────────────────────────────
-    # MPXJ's Asta reader does not surface consumable allocations at all, and
-    # a P6/XER export carries every resource assignment with its scheduled
-    # allocation dates. Read the allocation tables directly: consumables
-    # become temporary (consumed-in-quantity) assignments on their task with
-    # their LINKABLE_START/FINISH dates; permanent allocations contribute
-    # their scheduled dates to the matching assignment (matched by resource
-    # name where the skill → resource chain resolves).
-    try:
-        cons_names = dict(conn.execute(
-            'SELECT ID, NAME FROM CONSUMABLE_RESOURCE WHERE PROJID=?',
-            (chosen_p or 0,)).fetchall())
-        csa_rows = conn.execute(
-            'SELECT ALLOCATED_TO, ALLOCATION_OF, QUANTITY, LINKABLE_START, LINKABLE_FINISH '
-            'FROM CONSUMABLE_SCHEDU_ALLOCATION WHERE PROJID=?',
-            (chosen_p or 0,)).fetchall()
-    except Exception:
-        cons_names, csa_rows = {}, []
-    try:
-        perm_names = dict(conn.execute(
-            'SELECT ID, NAME FROM PERMANENT_RESOURCE WHERE PROJID=?',
-            (chosen_p or 0,)).fetchall())
-        skill_names = {}
-        for sid, app in conn.execute(
-                'SELECT ID, SKILL_APPEARANCE FROM PERM_RESOURCE_SKILL WHERE PROJID=?',
-                (chosen_p or 0,)).fetchall():
-            skill_names[sid] = perm_names.get(app) or ''
-        psa_rows = conn.execute(
-            'SELECT ALLOCATED_TO, ALLOCATION_OF, LINKABLE_START, LINKABLE_FINISH '
-            'FROM PERMANENT_SCHEDUL_ALLOCATION WHERE PROJID=?',
-            (chosen_p or 0,)).fetchall()
-    except Exception:
-        skill_names, psa_rows = {}, []
-    for at, aof, qty, ls, lf in csa_rows:
-        a = by_au.get(row_utid.get(at) or '')
-        if not a:
-            continue
-        a['resource_assignments'] = a.get('resource_assignments') or []
-        a['resource_assignments'].append({
-            'name': cons_names.get(aof) or 'Consumable',
-            'resource_type': 'temporary',
-            'category': 'plant',
-            'units': qty or 1,
-            'start': str(ls or '')[:10] or None,
-            'finish': str(lf or '')[:10] or None,
-        })
-    for at, aof, ls, lf in psa_rows:
-        a = by_au.get(row_utid.get(at) or '')
-        nm = skill_names.get(aof) or ''
-        if not a or not nm:
-            continue
-        for ra in a.get('resource_assignments') or []:
-            if ra.get('name') == nm and not ra.get('start'):
-                ra['start'] = str(ls or '')[:10] or None
-                ra['finish'] = str(lf or '')[:10] or None
 
-    # Hammock member pairs (hammock activity, member UTID) — wired into the
-    # links below once the rebuild has run.
-    hm_rowid = {}
-    for a in injected:
+def _extract_progress_periods(tmp_path):
+    """Read the progress_period table directly from the .pp SQLite database.
+
+    Asta Powerproject stores named progress periods (each with a report/data
+    date) in a 'progress_period' table, and the currently selected period in
+    the 'userr' table (CURRENT_PROGRESS_PERIOD column). MPXJ only exposes the
+    selected period's date via the project status date, so we read the full
+    list ourselves to let the user choose which period to view.
+
+    Returns (periods, current_period_id):
+        periods: list of {id, name, date} sorted by date ascending
+        current_period_id: the file's selected progress period ID (string or None)
+    """
+    periods = []
+    current_id = None
+    try:
+        conn = sqlite3.connect(tmp_path)
+        conn.row_factory = sqlite3.Row
         try:
-            hm_rowid[int(str(a.get('mpxj_unique_id') or '')[2:])] = a
-        except (ValueError, TypeError):
-            pass
-    member_pairs = []
-    if hm_rowid:
-        try:
-            for hm_rid, mem_rid in conn.execute(
-                    'SELECT MEMBERS, SUMMARISED_BY FROM HAMMOCK_TASK_MEMBERS WHERE PROJID=?',
-                    (chosen_p or 0,)).fetchall():
-                ha = hm_rowid.get(hm_rid)
-                mu = row_utid.get(mem_rid)
-                if ha and mu:
-                    member_pairs.append((ha, mu))
+            rows = conn.execute('SELECT * FROM progress_period').fetchall()
         except Exception:
-            member_pairs = []
-
-    try:
+            rows = []
+        seen_ids = set()
+        for i, r in enumerate(rows):
+            d = dict(r)
+            rid = d.get('ID')
+            # The progress_period table can repeat the same period row
+            # multiple times (one per view/summary that references it). Dedupe
+            # by ID so the dropdown shows each named period exactly once.
+            rid_str = str(rid) if rid is not None else str(i + 1)
+            if rid_str in seen_ids:
+                continue
+            seen_ids.add(rid_str)
+            date_str = _parse_ast_date(d.get('REPORT_DATE'))
+            name = (
+                d.get('NAME')
+                or d.get('SHORT_NAME')
+                or d.get('DESCRIPTION')
+                or d.get('TITLE')
+                or d.get('PERIOD_NAME')
+                or f'Period {i + 1}'
+            )
+            periods.append({
+                'id': rid_str,
+                'name': str(name),
+                'date': date_str,
+            })
+        try:
+            userr = conn.execute('SELECT * FROM userr LIMIT 1').fetchone()
+            if userr:
+                cp = dict(userr).get('CURRENT_PROGRESS_PERIOD')
+                if cp is not None:
+                    current_id = str(cp)
+        except Exception:
+            pass
         conn.close()
     except Exception:
         pass
-    if not chosen:
-        return
-
-    # ── Full link rebuild ─────────────────────────────────────────────────
-    # MPXJ reports every Asta relation as Finish-to-Start and silently drops
-    # links whose endpoints it never surfaced. Rebuild every activity's
-    # predecessor/successor lists from the source LINK table — one entry per
-    # LINK row, with the true kind and lag — for every pair whose endpoints
-    # are both in the parsed task list. The previous pair-by-pair zip onto
-    # MPXJ's relation list duplicated rows whenever the two lists drifted,
-    # corrupting the SS/FF mix, so the source table is authoritative. MPXJ
-    # relations for pairs the source does not hold are kept as a fallback.
-    pop = set()
-    for a in activities:
-        au = str(a.get('asta_id') or '').strip()
-        if au:
-            pop.add(au)
-    preds_of, succs_of = {}, {}
-    for key, rows in chosen.items():
-        pr, _, su = key.partition('>')
-        if pr not in pop or su not in pop:
-            continue
-        for t, lag, _ambig, _drv, _rid in rows:
-            preds_of.setdefault(su, []).append(
-                {'pred_id': pr, 'pred_unique_id': pr, 'link_type': t, 'lag_days': lag})
-            succs_of.setdefault(pr, []).append(
-                {'succ_unique_id': su, 'succ_id': su, 'link_type': t, 'lag_days': lag})
-    pred_pairs = {(e['pred_id'], su) for su, lst in preds_of.items() for e in lst}
-    succ_pairs = {(pr, e['succ_unique_id']) for pr, lst in succs_of.items() for e in lst}
-
-    for a in activities:
-        au = str(a.get('asta_id') or '').strip()
-        rebuilt_preds = preds_of.get(au) or []
-        kept_preds = [p for p in (a.get('all_predecessors') or [])
-                      if (str(p.get('pred_unique_id') or p.get('pred_id') or '').strip(), au)
-                      not in pred_pairs]
-        a['all_predecessors'] = rebuilt_preds + kept_preds
-        rebuilt_succs = succs_of.get(au) or []
-        kept_succs = [s for s in (a.get('all_successors') or [])
-                      if (au, str(s.get('succ_unique_id') or s.get('succ_id') or '').strip())
-                      not in succ_pairs]
-        a['all_successors'] = rebuilt_succs + kept_succs
-        if a['all_predecessors']:
-            fp = a['all_predecessors'][0]
-            a['predecessor_asta_id'] = fp.get('pred_id', '')
-            a['link_type'] = fp.get('link_type', 'FS')
-            a['lag_days'] = fp.get('lag_days', 0)
-        if a['all_successors']:
-            a['successor_asta_id'] = a['all_successors'][0].get('succ_unique_id', '')
-        c = chosen_con.get(au)
-        if c:
-            a['constraint_type'] = c[0]
-            a['constraint_date'] = c[1]
-
-    # ── LOE driving links ─────────────────────────────────────────────────
-    # An Asta hammock's span follows the tasks it covers: it starts when its
-    # first member starts and finishes when its last member finishes. Wire
-    # each injected LOE to the members in its HAMMOCK_TASK_MEMBERS cover set
-    # — the relationships a P6 export of the same file carries (SS from the
-    # hammock into every member, FF from every member back into the hammock)
-    # — and sit the hammock in the same WBS parent as its first member. For
-    # hammocks whose cover set cannot be resolved, fall back to the tasks
-    # coinciding with the span boundaries.
-    hm_ids = {str(a.get('asta_id') or '').strip() for a in injected}
-    wired = set()
-    for ha, mu in member_pairs:
-        m = by_au.get(mu)
-        if not m:
-            continue
-        au = str(ha.get('asta_id') or '').strip()
-        m['all_predecessors'] = m.get('all_predecessors') or []
-        m['all_predecessors'].append(
-            {'pred_id': au, 'pred_unique_id': au, 'link_type': 'SS', 'lag_days': 0})
-        m['all_successors'] = m.get('all_successors') or []
-        m['all_successors'].append(
-            {'succ_unique_id': au, 'succ_id': au, 'link_type': 'SS', 'lag_days': 0})
-        m['all_successors'].append(
-            {'succ_unique_id': au, 'succ_id': au, 'link_type': 'FF', 'lag_days': 0})
-        ha['all_predecessors'] = ha.get('all_predecessors') or []
-        ha['all_predecessors'].append(
-            {'pred_id': mu, 'pred_unique_id': mu, 'link_type': 'FF', 'lag_days': 0})
-        ha['all_successors'] = ha.get('all_successors') or []
-        ha['all_successors'].append(
-            {'succ_unique_id': mu, 'succ_id': mu, 'link_type': 'SS', 'lag_days': 0})
-        if not m.get('successor_asta_id'):
-            m['successor_asta_id'] = au
-        if m.get('parent_asta_id') and not ha.get('parent_asta_id'):
-            ha['parent_asta_id'] = m['parent_asta_id']
-        wired.add(au)
-    if hm_ids:
-        pool = [a for a in activities
-                if not a.get('is_summary') and not a.get('is_milestone')
-                and str(a.get('asta_id') or '').strip() not in hm_ids
-                and a.get('early_start') and a.get('early_finish')]
-        for a in activities:
-            au = str(a.get('asta_id') or '').strip()
-            if au not in hm_ids or au in wired:
-                continue
-            members = [m for m in pool
-                       if m['early_start'] >= a['early_start']
-                       and m['early_finish'] <= a['early_finish']
-                       and (m['early_start'] == a['early_start']
-                            or m['early_finish'] == a['early_finish'])]
-            if not members:
-                continue
-            first = min(members, key=lambda m: m['early_start'])
-            last = max(members, key=lambda m: m['early_finish'])
-            for m, t in ((first, 'SS'), (last, 'FF')):
-                a['all_predecessors'] = a.get('all_predecessors') or []
-                a['all_predecessors'].append(
-                    {'pred_id': m['asta_id'], 'pred_unique_id': m['asta_id'],
-                     'link_type': t, 'lag_days': 0})
-                m['all_successors'] = m.get('all_successors') or []
-                m['all_successors'].append(
-                    {'succ_unique_id': a['asta_id'], 'succ_id': a['asta_id'],
-                     'link_type': t, 'lag_days': 0})
-                if not m.get('successor_asta_id'):
-                    m['successor_asta_id'] = a['asta_id']
-            if a['all_predecessors']:
-                a['predecessor_asta_id'] = a['all_predecessors'][0]['pred_id']
-                a['link_type'] = a['all_predecessors'][0]['link_type']
-                a['lag_days'] = a['all_predecessors'][0]['lag_days']
+    # Sort by date ascending (empty dates sort first)
+    periods.sort(key=lambda p: p['date'] or '')
+    return periods, current_id
 
 
-def _inject_hammocks(conn, p, status_date=None):
-    """Asta hammock (level-of-effort) tasks live in their own HAMMOCK_TASK
-    table, which MPXJ's reader does not surface — a P6 import of the same
-    file carries them as regular activities. Read them from the source
-    database and inject them as leaf activities with the current (early)
-    schedule dates; their parent is the expanded-task container they sit
-    under. Returns [] for files without the table (non-Asta sources)."""
+def _extract_baselines(project):
+    baselines = []
     try:
-        rows = conn.execute(
-            'SELECT ID, UNIQUE_TASK_ID, NAME, EARLY_START_DATE, EARLY_END_DATE_RS, '
-            'LATE_START_DATE, LATE_END_DATE_RS, USER_PERCENT_COMPLETE, SUBPROJECT_ID '
-            'FROM HAMMOCK_TASK WHERE PROJID=?', (p,)).fetchall()
-    except Exception:
-        return []
-    if not rows:
-        return []
-    parent = {}
-    try:
-        for rid, utid in conn.execute(
-                'SELECT ID, UNIQUE_TASK_ID FROM EXPANDED_TASK WHERE PROJID=?', (p,)):
-            parent[rid] = str(utid or '').strip()
+        bl_map = project.getBaselines()
+        if not bl_map:
+            return baselines
+        for entry in bl_map.entrySet():
+            bl_project = entry.getValue()
+            if bl_project is None:
+                continue
+            bl_tasks = []
+            try:
+                for t in bl_project.getTasks():
+                    bl_tasks.append({
+                        'aid': _get_asta_utid(t),
+                        'sd': _to_date_str(t.getStart()),
+                        'ed': _to_date_str(t.getFinish()),
+                        'od': _to_date_str(t.getStart()),
+                    })
+            except Exception:
+                pass
+            if bl_tasks:
+                try:
+                    name = str(bl_project.getProjectProperties().getName()) or f'Baseline {len(baselines) + 1}'
+                except Exception:
+                    name = f'Baseline {len(baselines) + 1}'
+                baselines.append({
+                    'name': name,
+                    'date': _to_date_str(bl_project.getProjectProperties().getStartDate()),
+                    'tasks': bl_tasks,
+                })
     except Exception:
         pass
-    out = []
-    for rid, utid, name, es, ef, ls, lf, pct, sub in rows:
-        au = str(utid or '').strip()
-        s, e = str(es or '')[:10], str(ef or '')[:10]
-        if not au or not s or not e:
-            continue
-        sd, ed = str(es)[:19].replace(' ', 'T'), str(ef)[:19].replace(' ', 'T')
-        ls_s = str(ls or '')[:10] or None
-        lf_s = str(lf or '')[:10] or None
+    return baselines
+
+
+@app.route('/parse', methods=['POST'])
+def parse():
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+
+    uploaded_file = request.files['file']
+    tmp_path = f'/tmp/{uploaded_file.filename}'
+
+    try:
+        uploaded_file.save(tmp_path)
+        project = UniversalProjectReader().read(tmp_path)
+
+        tasks = list(project.getTasks())
+
+        activities = []
+        for task in tasks:
+            try:
+                name = task.getName()
+                if not name:
+                    continue
+
+                # ── IDs ──────────────────────────────────────────────────────
+                # getActivityID() = Asta UTID (the "Unique Task ID" shown in
+                #   Asta's ID column — alphanumeric, permanent, user-visible)
+                # getUniqueID() = MPXJ's internal integer unique ID
+                # getID() = sequential display/row ID (renumbered by MPXJ)
+                asta_utid = _get_asta_utid(task)
+                mpxj_uid = _safe_str(task.getUniqueID())
+
+                # ── Dates ─────────────────────────────────────────────────────
+                planned_start = task.getStart()
+                planned_finish = task.getFinish()
+                actual_start = task.getActualStart()
+                actual_finish = task.getActualFinish()
+                early_start = task.getEarlyStart()
+                early_finish = task.getEarlyFinish()
+                late_start = task.getLateStart()
+                late_finish = task.getLateFinish()
+                baseline_start = task.getBaselineStart()
+                baseline_finish = task.getBaselineFinish()
+
+                # Skip the project summary task (root level, no dates)
+                if planned_start is None and planned_finish is None and actual_start is None:
+                    continue
+
+                # ── Progress ────────────────────────────────────────────────
+                pct_complete = _get_percentage_complete(task)
+
+                # ── Hierarchy ───────────────────────────────────────────────
+                parent_uid = _get_parent_uid(task)
+                is_summary = _is_summary_task(task)
+
+                # ── Dependencies (all links) ────────────────────────────────
+                predecessors = _get_predecessors(task)
+                # First predecessor for backward compat with schema's single-field
+                first_pred = predecessors[0] if predecessors else None
+
+                # ── Flags & attributes ──────────────────────────────────────
+                is_milestone = _is_milestone(task)
+                is_critical = _is_critical(task)
+                outline_level = _get_outline_level(task)
+                priority = _get_priority(task)
+                cost = _get_cost(task)
+                calendar_name = _get_calendar_name(task)
+                calendar_working_days, calendar_is_24_7 = _get_calendar_details(task)
+                duration_type = _get_duration_type(task)
+                notes = _get_notes(task)
+                constraint = _constraint_type(task)
+                constraint_date = _to_date_str(task.getConstraintDate())
+                resources = _get_resource_names(task)
+                resource_assignments = _get_resource_assignments(task)
+
+                # ── Status from actuals ─────────────────────────────────────
+                status = _compute_status(task, pct_complete, actual_start, actual_finish)
+
+                # ── Durations (all derived in calendar days, never hours) ──
+                duration_days = _get_duration_days(task)
+                original_duration_days = _get_original_duration_days(task)
+                actual_duration_days = _get_actual_duration_days(task, duration_days)
+                remaining_duration_days = _get_remaining_duration_days(duration_days, actual_duration_days)
+
+                # Date-only + full timestamp strings. A milestone is a
+                # zero-duration point event, so collapse end→start and force
+                # duration to 0; the Gantt renders a single diamond at the
+                # event instant. Asta places the event at the start of the
+                # working day (8am) for start milestones and the end of the
+                # working day (5pm) for finish milestones — a milestone's
+                # start and finish are the same instant, so preserving
+                # planned_start captures the correct event time for both.
+                start_date_str = _to_date_str(planned_start)
+                start_dt = _to_iso_exact(planned_start)
+                if is_milestone:
+                    duration_days = 0
+                    actual_duration_days = 0
+                    remaining_duration_days = 0
+                    end_date_str = start_date_str
+                    end_dt = start_dt
+                else:
+                    end_date_str = _to_date_str(planned_finish) or start_date_str
+                    end_dt = _to_iso_exact(planned_finish) or start_dt
+
+                # Use the Asta UTID as the primary asta_id, fallback to UniqueID
+                asta_id = asta_utid if asta_utid else mpxj_uid
+
+                # ── Successors, float, type, WBS code, cost detail ─────────────
+                successors = _get_successors(task)
+                first_succ = successors[0] if successors else None
+                total_float_days = _get_total_float_days(task)
+                free_float_days = _get_free_float_days(task)
+                task_type = _get_task_type(task)
+                wbs_code = _get_wbs_code(task)
+                actual_cost = _get_actual_cost(task)
+                remaining_cost = _get_remaining_cost(task)
+                baseline_cost = _get_baseline_cost(task)
+
+                activities.append({
+                    'asta_id': asta_id,
+                    'mpxj_unique_id': mpxj_uid,
+                    'name': str(name),
+                    # Date-only fields (YYYY-MM-DD) — kept for date columns,
+                    # calendar grouping, and backward compatibility.
+                    'start_date': start_date_str,
+                    'end_date': end_date_str,
+                    'actual_start': _to_date_str(actual_start),
+                    'actual_finish': _to_date_str(actual_finish),
+                    'early_start': _to_date_str(early_start),
+                    'early_finish': _to_date_str(early_finish),
+                    'late_start': _to_date_str(late_start),
+                    'late_finish': _to_date_str(late_finish),
+                    'baseline_start': _to_date_str(baseline_start),
+                    'baseline_finish': _to_date_str(baseline_finish),
+                    # Full timestamps (YYYY-MM-DDTHH:MM:SS) — the absolute
+                    # source of truth. The frontend Gantt uses the time
+                    # portion to position bar edges with sub-day precision,
+                    # so a half-day finishing at 12:00 renders as a half-day.
+                    'start_datetime': start_dt,
+                    'end_datetime': end_dt,
+                    'actual_start_datetime': _to_iso_exact(actual_start),
+                    'actual_finish_datetime': _to_iso_exact(actual_finish),
+                    'early_start_datetime': _to_iso_exact(early_start),
+                    'early_finish_datetime': _to_iso_exact(early_finish),
+                    'late_start_datetime': _to_iso_exact(late_start),
+                    'late_finish_datetime': _to_iso_exact(late_finish),
+                    'baseline_start_datetime': _to_iso_exact(baseline_start),
+                    'baseline_finish_datetime': _to_iso_exact(baseline_finish),
+                    'duration_days': duration_days,
+                    'original_duration_days': original_duration_days,
+                    'duration_type': duration_type,
+                    'actual_duration_days': actual_duration_days,
+                    'remaining_duration_days': remaining_duration_days,
+                    'percentage_complete': pct_complete,
+                    'status': status,
+                    'wbs_level': outline_level,
+                    'parent_asta_id': parent_uid,
+                    'is_summary': is_summary,
+                    'is_milestone': is_milestone,
+                    'is_critical': is_critical,
+                    'predecessor_asta_id': first_pred['pred_unique_id'] if first_pred else '',
+                    'link_type': first_pred['link_type'] if first_pred else 'FS',
+                    'lag_days': first_pred['lag_days'] if first_pred else 0,
+                    'all_predecessors': predecessors,
+                    'priority': priority,
+                    'cost': cost,
+                    'calendar_name': calendar_name,
+                    'calendar_working_days': calendar_working_days,
+                    'calendar_is_24_7': calendar_is_24_7,
+                    'notes': notes,
+                    'constraint_type': constraint,
+                    'constraint_date': constraint_date,
+                    'resources': resources,
+                    'resource_assignments': resource_assignments,
+                    'activity_codes': _get_activity_codes(task),
+                    'all_successors': successors,
+                    'successor_asta_id': first_succ['succ_unique_id'] if first_succ else '',
+                    'total_float_days': total_float_days,
+                    'free_float_days': free_float_days,
+                    'task_type': task_type,
+                    'wbs_code': wbs_code,
+                    'actual_cost': actual_cost,
+                    'remaining_cost': remaining_cost,
+                    'baseline_cost': baseline_cost,
+                })
+            except Exception:
+                continue
+
+        # Correct Asta link types (MPXJ reports all FS) and lags (stored in
+        # hours) directly from the .pp database before returning. The
+        # project status date drives injected-hammock progress status.
         try:
-            dur = (date.fromisoformat(e) - date.fromisoformat(s)).days + 1
+            _sd = project.getStatusDate()
+            status_date = _to_date_str(_sd) if _sd else None
         except Exception:
-            dur = 0
-        out.append({
-            'asta_id': au,
-            'mpxj_unique_id': f'HM{rid}',
-            'name': str(name or au),
-            'start_date': s,
-            'end_date': e,
-            'actual_start': None,
-            'actual_finish': None,
-            'early_start': s,
-            'early_finish': e,
-            'late_start': ls_s,
-            'late_finish': lf_s,
-            'baseline_start': None,
-            'baseline_finish': None,
-            'start_datetime': sd,
-            'end_datetime': ed,
-            'actual_start_datetime': None,
-            'actual_finish_datetime': None,
-            'early_start_datetime': sd,
-            'early_finish_datetime': ed,
-            'late_start_datetime': str(ls)[:19].replace(' ', 'T') if ls else None,
-            'late_finish_datetime': str(lf)[:19].replace(' ', 'T') if lf else None,
-            'baseline_start_datetime': None,
-            'baseline_finish_datetime': None,
-            'duration_days': dur,
-            'duration_type': 'working',
-            'actual_duration_days': 0,
-            'remaining_duration_days': dur,
-            'percentage_complete': pct or 0,
-            # A hammock whose span has opened before the status date reads as
-            # in progress in the P6/XER export (no actual dates — its early
-            # dates before the progress date are what the toolkit scores).
-            'status': 'in_progress' if (status_date and s <= str(status_date)[:10]) else 'pending',
-            'wbs_level': '',
-            'parent_asta_id': parent.get(sub) or '',
-            'is_summary': False,
-            'is_milestone': False,
-            'is_critical': False,
-            'predecessor_asta_id': '',
-            'link_type': 'FS',
-            'lag_days': 0,
-            'all_predecessors': [],
-            'priority': 0,
-            'cost': 0,
-            'calendar_name': '',
-            'calendar_working_days': [],
-            'calendar_is_24_7': False,
-            'notes': '',
-            'constraint_type': '',
-            'constraint_date': '',
-            'resources': [],
-            'resource_assignments': [],
-            'activity_codes': {},
-            'all_successors': [],
-            'successor_asta_id': '',
-            'total_float_days': None,
-            'free_float_days': None,
-            'task_type': 'Level Of Effort',
-            'wbs_code': '',
-            'actual_cost': 0,
-            'remaining_cost': 0,
-            'baseline_cost': 0,
+            status_date = None
+        correct_asta_links(activities, tmp_path, status_date)
+
+        baselines = _extract_baselines(project)
+
+        all_starts = [a['start_date'] for a in activities if a['start_date']]
+        all_ends = [a['end_date'] for a in activities if a['end_date']]
+        project_start = min(all_starts) if all_starts else None
+        project_end = max(all_ends) if all_ends else None
+
+        working_days = _extract_working_days(project)
+        calendar_exceptions = _extract_calendar_exceptions(project)
+        # Asta .pp: MPXJ does not expose calendar exceptions (bank holidays,
+        # Christmas shutdowns ...) — read them straight from the source
+        # database instead. Non-Asta files keep the MPXJ extraction above.
+        asta_exceptions = extract_calendar_exceptions(tmp_path, activities)
+        if asta_exceptions:
+            calendar_exceptions = asta_exceptions
+        progress_periods, current_progress_period_id = _extract_progress_periods(tmp_path)
+        code_libraries = _extract_code_libraries(project)
+
+        return jsonify({
+            'activities': activities,
+            'project_start': project_start,
+            'project_end': project_end,
+            'baselines': baselines,
+            'working_days': working_days,
+            'calendar_exceptions': calendar_exceptions,
+            'progress_periods': progress_periods,
+            'current_progress_period_id': current_progress_period_id,
+            'code_libraries': code_libraries,
         })
-    return out
+
+    except Exception as e:
+        return jsonify({
+            'error': str(e),
+            'traceback': traceback.format_exc()
+        }), 500
+    finally:
+        if os.path.exists(tmp_path):
+            try:
+                os.remove(tmp_path)
+            except Exception:
+                pass
+
+
+@app.route('/export', methods=['POST'])
+def export():
+    """Export a programme to MS Project XML (MSPDI), applying activity overrides
+    from the app (dates / % complete / actuals) so the exported file reflects
+    in-app changes. Reads any format UniversalProjectReader understands (Asta .pp,
+    MS Project XML, P6 ...) and writes MSPDI, which Powerproject can re-import.
+    Native Asta .pp cannot be written (proprietary) — MSPDI is the round-trip path.
+    """
+    if 'file' not in request.files:
+        return jsonify({'error': 'No file provided'}), 400
+    uploaded_file = request.files['file']
+    try:
+        overrides = json.loads(request.form.get('overrides', '[]'))
+    except Exception:
+        return jsonify({'error': 'Invalid overrides JSON'}), 400
+    fmt = (request.form.get('format') or 'mspdi').lower()
+    if fmt not in ('mspdi', 'xer'):
+        return jsonify({'error': 'Unsupported format'}), 400
+
+    tmp_path = f'/tmp/{uploaded_file.filename}'
+    base = os.path.splitext(uploaded_file.filename)[0] or 'programme'
+    ext = 'xer' if fmt == 'xer' else 'xml'
+    out_path = f'/tmp/{base}_export.{ext}'
+
+    try:
+        uploaded_file.save(tmp_path)
+        project = UniversalProjectReader().read(tmp_path)
+
+        override_by_aid = {}
+        override_by_uid = {}
+        for o in overrides:
+            aid = str(o.get('asta_id') or '').strip()
+            uid = str(o.get('mpxj_unique_id') or '').strip()
+            if aid:
+                override_by_aid[aid] = o
+            if uid:
+                override_by_uid[uid] = o
+
+        LocalDateTime = jpype.JClass('java.time.LocalDateTime')
+
+        def _parse_ldt(s):
+            if not s:
+                return None
+            try:
+                s = str(s).strip()
+                if len(s) == 10:
+                    return LocalDateTime.parse(s + 'T08:00:00')
+                return LocalDateTime.parse(s[:19])
+            except Exception:
+                return None
+
+        for task in project.getTasks():
+            try:
+                if _is_summary_task(task):
+                    continue
+                aid = _get_asta_utid(task)
+                uid = _safe_str(task.getUniqueID())
+                o = override_by_aid.get(aid) or override_by_uid.get(uid)
+                if not o:
+                    continue
+                start = _parse_ldt(o.get('start') or o.get('start_datetime'))
+                finish = _parse_ldt(o.get('finish') or o.get('end_datetime'))
+                if start is not None:
+                    task.setStart(start)
+                if finish is not None:
+                    task.setFinish(finish)
+                elif start is not None:
+                    task.setFinish(start)
+                pct = o.get('percent')
+                if pct is not None:
+                    try:
+                        task.setPercentageComplete(float(pct))
+                    except Exception:
+                        pass
+                status = str(o.get('status') or '').lower()
+                a_start = _parse_ldt(o.get('actual_start')) or (start if status in ('in_progress', 'completed') else None)
+                a_finish = _parse_ldt(o.get('actual_finish')) or (finish if status == 'completed' else None)
+                if a_start is not None:
+                    try:
+                        task.setActualStart(a_start)
+                    except Exception:
+                        pass
+                if a_finish is not None:
+                    try:
+                        task.setActualFinish(a_finish)
+                    except Exception:
+                        pass
+            except Exception:
+                continue
+
+        # Resolve the writer class lazily. The bundled MPXJ jar exposes classes
+        # under org.mpxj (mirroring the reader import above); fall back to the
+        # net.sf.mpxj namespace in case a different jar build is in use.
+        if fmt == 'xer':
+            XERWriter = None
+            for cls_name in ('org.mpxj.primavera.PrimaveraXERFileWriter', 'org.mpxj.primavera.PrimaveraXERWriter', 'net.sf.mpxj.primavera.PrimaveraXERFileWriter', 'net.sf.mpxj.primavera.PrimaveraXERWriter'):
+                try:
+                    XERWriter = jpype.JClass(cls_name)
+                    break
+                except Exception:
+                    continue
+            if XERWriter is None:
+                raise RuntimeError('PrimaveraXERFileWriter class not found on the MPXJ classpath.')
+            XERWriter().write(project, out_path)
+            return send_file(out_path, as_attachment=True, download_name=f'{base}.xer', mimetype='application/octet-stream')
+        MSPDIWriter = None
+        for cls_name in ('org.mpxj.mspdi.MSPDIWriter', 'net.sf.mpxj.mspdi.MSPDIWriter'):
+            try:
+                MSPDIWriter = jpype.JClass(cls_name)
+                break
+            except Exception:
+                continue
+        if MSPDIWriter is None:
+            raise RuntimeError('MSPDIWriter class not found on the MPXJ classpath (no MSPDI writer jar available).')
+        MSPDIWriter().write(project, out_path)
+        return send_file(out_path, as_attachment=True, download_name=f'{base}.xml', mimetype='application/xml')
+    except Exception as e:
+        return jsonify({'error': str(e), 'traceback': traceback.format_exc()}), 500
+    finally:
+        for p in (tmp_path, out_path):
+            if os.path.exists(p):
+                try:
+                    os.remove(p)
+                except Exception:
+                    pass
+
+
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok', 'service': 'mpxj-parser'})
+
+
+if __name__ == '__main__':
+    port = int(os.environ.get('PORT', 5000))
+    app.run(host='0.0.0.0', port=port)
